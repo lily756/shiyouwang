@@ -1,0 +1,21 @@
+{
+  "name": "localtest",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.0",
+    "@seald-io/nedb": "^4.1.2",
+    "dotenv": "^17.4.2",
+    "openai": "^7.0.0",
+    "telegraf": "^4.16.3"
+  }
+}
