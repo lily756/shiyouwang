@@ -18,6 +18,11 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 const DATA_FILE = path.join(__dirname, "data");
 const ROLES_SEED_FILE = path.join(__dirname, "roles.json");
 const ROLE_ASSETS_DIR = path.join(__dirname, "role-assets");
+const MODEL_SAFETY_TRACE_DIR = path.join(__dirname, "runtime-logs");
+const MODEL_SAFETY_TRACE_FILE = path.join(
+  MODEL_SAFETY_TRACE_DIR,
+  "model-safety-traces.ndjson",
+);
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const MAX_TOOL_ROUNDS = 4;
 const ADMIN_USER_IDS = new Set(
@@ -63,6 +68,9 @@ const VIDEO_TASK_POLL_INTERVAL_MS = 3_000;
 const VIDEO_TASK_TIMEOUT_MS = 10 * 60 * 1_000;
 const TEXT_MODEL = process.env.OPENAI_MODEL || "";
 const VISION_MODEL = process.env.OPENAI_VISION_MODEL || TEXT_MODEL;
+const OPENAI_THINKING_ENABLED = !["false", "0", "no", "off"].includes(
+  String(process.env.OPENAI_THINKING_ENABLED || "false").trim().toLowerCase(),
+);
 const HAS_SEPARATE_VISION_PROVIDER = Boolean(
   process.env.OPENAI_VISION_API_KEY || process.env.OPENAI_VISION_API_BASE_URL,
 );
@@ -78,8 +86,9 @@ const DEFAULT_TOOL_SETTINGS = Object.freeze({
 const TOOL_USE_SYSTEM_PROMPT = [
   "你正在进行角色对话，并且可能有工具可用。",
   "当用户需要准确的当前时间时，必须调用 get_current_time，不能凭记忆猜测。",
-  "仅当用户明确要求生成、绘制或创作角色图片时，才调用 generate_character_image。",
+  "除非用户明确表示不要图片，当当前角色刚换装、来到漂亮或有故事感的场景、发生自然的自拍/打卡/纪念瞬间，或对话中出现其他确实值得用一张照片记录的具体画面时，主动调用 generate_character_image，把照片直接发给用户。每条用户消息至多主动生成一张；不要因为抽象感慨、普通寒暄、知识问答或只有一个形容词就滥用图片。",
   "调用 generate_character_image 时，必须同时提供 caption：用当前角色口吻写 1～3 句俏皮、自然的配文，结合最近对话或用户刚提出的画面。不要写“正在生成图片”“角色图片已生成”等操作提示，也不要复述 system prompt。图片发送成功后，继续用角色口吻接住用户的话题。",
+  "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会优先使用已保存的人设图保持角色的面部、发型和 2D 画风。若画面只是纯风景、物品、食物或与角色本人无关的内容，设为 false，不能强行让角色入镜。",
   "仅当管理员在私聊中明确要求生成、创建或更新当前角色的“设定图/参考图/角色立绘”时，才把 generate_character_image 的 save_as_role_reference 设为 true；这会把生成图保存为全局角色资产，供后续视频锁定角色身份和画风。普通场景图、壁纸或随手图片绝不能覆盖角色设定图。",
   "仅当用户明确要求生成、制作或创作当前角色的视频/动态短片时，才调用 generate_character_video。该工具会自动把当前角色已保存的设定图作为唯一的 @图片1 参考素材（reference_image），用于锁定角色身份与画风，而不是限定视频首帧；不要在 prompt 中自行编造其他 @图片N、@视频N、@音频N 或 Asset ID。若工具提示当前角色没有设定图，应请管理员先生成或上传并保存设定图。",
   "调用 generate_character_video 前，先判断用户是否至少给出了主体和核心动作；如果只是一句高度概括的想法且缺少这两项，应先用角色口吻追问，不要擅自编造。信息足够时，将用户意图改写为 Seedance 工程化中文提示词：简单单场景用一段式写清主体、连续细节动作、场景、光影/风格和单一运镜；有多个事件或场景时用“镜头1/镜头2 …”按顺序写分镜，不写绝对秒数，每个镜头只保留一种运镜。程序会自动加入 @图片1 的角色参考绑定，以及画质、稳定和文字/水印约束。",
@@ -396,7 +405,7 @@ function getToolDefinitions(ctx, { mcdContext = null, imageEditReference = null 
     function: {
       name: "generate_character_image",
       description:
-        "为当前角色或用户指定角色生成一张图片。只在用户明确要求生成、绘制、创作或制作角色图片时使用。",
+        "为当前角色或用户指定主题生成一张图片。用户明确要求生成图片时可用；当角色换装、遇到值得自拍/打卡/纪念的具体画面时，也应主动调用。每条用户消息最多生成一张。",
       parameters: {
         type: "object",
         properties: {
@@ -410,13 +419,18 @@ function getToolDefinitions(ctx, { mcdContext = null, imageEditReference = null 
             description:
               "发送图片时附带的中文文案。必须用当前角色口吻写 1～3 句，俏皮自然，并结合最近对话或用户刚提出的画面；不要使用“正在生成图片”“角色图片已生成”之类冷冰冰的操作提示。",
           },
+          include_current_role: {
+            type: "boolean",
+            description:
+              "画面主体是否包含当前角色本人。自拍、换装照、角色在景点打卡或角色参与的场景设为 true，程序会优先带入该角色已保存的人设图；纯风景、物品、食物或与角色无关的图设为 false。",
+          },
           save_as_role_reference: {
             type: "boolean",
             description:
               "仅限管理员明确要求生成、更新当前角色的设定图/参考图/立绘时设为 true。普通图片生成必须省略或设为 false。",
           },
         },
-        required: ["prompt", "caption"],
+        required: ["prompt", "caption", "include_current_role"],
         additionalProperties: false,
       },
     },
@@ -857,10 +871,56 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
   }
 }
 
-async function requestCharacterImage(prompt) {
-  return getActiveImageProvider() === "seedream"
-    ? requestSeedreamImage({ prompt })
-    : requestNewApiCharacterImage(prompt);
+function buildRoleReferenceImagePrompt({ prompt, roleName, maxLength = 0 }) {
+  const normalizedPrompt = typeof prompt === "string" ? prompt.replace(/\s+/g, " ").trim() : "";
+  const name = typeof roleName === "string" ? roleName.trim().slice(0, 64) : "当前角色";
+  const result = [
+    `生成一张全新的角色照片，画面要求：${normalizedPrompt}`,
+    `以输入的人设图作为「${name}」的身份与 2D 动漫画风参考，保持面部、发型、体态和主配色一致。`,
+    "可按画面要求改变服装、姿势、镜头和场景，不要复制参考图的构图；不要生成文字、水印或 Logo。",
+  ].join("\n");
+  return maxLength > 0 ? result.slice(0, maxLength).trim() : result;
+}
+
+function toImageReferenceDataUrl(referenceImage) {
+  if (!referenceImage?.ok || !Buffer.isBuffer(referenceImage.image)) {
+    return null;
+  }
+  if (referenceImage.image.length === 0 || referenceImage.image.length > MAX_IMAGE_REFERENCE_BYTES) {
+    return null;
+  }
+  return `data:${normalizeRoleReferenceMimeType(referenceImage.mimeType)};base64,${referenceImage.image.toString("base64")}`;
+}
+
+async function requestCharacterImage(prompt, { roleReference = null } = {}) {
+  if (!roleReference?.ok) {
+    return getActiveImageProvider() === "seedream"
+      ? requestSeedreamImage({ prompt })
+      : requestNewApiCharacterImage(prompt);
+  }
+
+  if (getActiveImageProvider() === "seedream") {
+    const referenceDataUrl = toImageReferenceDataUrl(roleReference);
+    if (!referenceDataUrl) {
+      return { ok: false, error: "角色人设图无效，无法作为图片参考图。" };
+    }
+    return requestSeedreamImage({
+      prompt: buildRoleReferenceImagePrompt({ prompt, roleName: roleReference.roleName }),
+      referenceImages: [referenceDataUrl],
+    });
+  }
+
+  return requestNewApiReferenceImageEdit({
+    referenceImage: roleReference.image,
+    mimeType: roleReference.mimeType,
+    instruction: buildRoleReferenceImagePrompt({
+      prompt,
+      roleName: roleReference.roleName,
+      maxLength: 620,
+    }),
+    editType: "scene",
+    roleName: roleReference.roleName,
+  });
 }
 
 function normalizeImageEditType(value) {
@@ -1602,7 +1662,7 @@ async function deliverCharacterImage(ctx, image, rawCaption) {
 async function executeToolCall(
   ctx,
   toolCall,
-  { imageEditReference = null, mcdContext = null } = {},
+  { imageEditReference = null, mcdContext = null, imageGenerationState = null } = {},
 ) {
   const parsedArguments = parseToolArguments(toolCall.function?.arguments);
   if (!parsedArguments.ok) {
@@ -1637,24 +1697,43 @@ async function executeToolCall(
         error: "只有管理员在私聊中才能更新全局角色设定图。",
       };
     }
+    if (imageGenerationState?.used) {
+      return { ok: false, error: "本条消息已经生成过一张图片，请不要重复生成。" };
+    }
+    if (imageGenerationState) {
+      imageGenerationState.used = true;
+    }
 
     await ctx.reply("先别眨眼——我去把刚才那一幕冲洗出来。✨");
-    const image = await requestCharacterImage(args.prompt);
+    const shouldUseRoleReference =
+      args.include_current_role === true || args.save_as_role_reference === true;
+    let roleReference = null;
+    let roleReferenceWarning = "";
+    if (shouldUseRoleReference) {
+      const loadedReference = await loadCurrentRoleReferenceImage(ctx);
+      if (loadedReference.ok) {
+        roleReference = loadedReference;
+      } else {
+        roleReferenceWarning = loadedReference.error;
+      }
+    }
+
+    const image = await requestCharacterImage(args.prompt, { roleReference });
     if (!image.ok) {
       return image;
     }
 
-    let roleReference = null;
+    let savedRoleReference = null;
     if (args.save_as_role_reference === true) {
       try {
         const generatedImage = await readGeneratedCharacterImage(image);
-        roleReference = await saveCurrentRoleReferenceImage(ctx, {
+        savedRoleReference = await saveCurrentRoleReferenceImage(ctx, {
           ...generatedImage,
           source: "generated",
         });
       } catch (error) {
         console.error("保存生成的角色设定图失败:", error);
-        roleReference = {
+        savedRoleReference = {
           ok: false,
           error: "图片已生成，但保存为角色设定图失败。请确认图片可下载后重试。",
         };
@@ -1666,24 +1745,31 @@ async function executeToolCall(
     if (!delivery.delivered) {
       return { ok: false, error: "图片已生成，但发送到 Telegram 失败。" };
     }
-    if (roleReference && !roleReference.ok) {
+    if (savedRoleReference && !savedRoleReference.ok) {
       return {
         ok: true,
         imageDelivered: true,
         roleReferenceSaved: false,
-        warning: roleReference.error,
+        warning: savedRoleReference.error,
         caption,
       };
     }
-    return roleReference?.ok
+    return savedRoleReference?.ok
       ? {
           ok: true,
           imageDelivered: true,
           roleReferenceSaved: true,
-          roleName: roleReference.roleName,
+          roleName: savedRoleReference.roleName,
+          roleReferenceUsed: Boolean(roleReference),
           caption,
         }
-      : { ok: true, imageDelivered: true, caption };
+      : {
+          ok: true,
+          imageDelivered: true,
+          roleReferenceUsed: Boolean(roleReference),
+          ...(roleReferenceWarning ? { warning: roleReferenceWarning } : {}),
+          caption,
+        };
   }
 
   if (toolCall.function.name === "generate_character_video") {
@@ -1864,6 +1950,63 @@ function toStoredToolCall(toolCall) {
   };
 }
 
+const MODEL_SAFETY_REFUSAL_PATTERNS = [
+  /(?:你好[，,]?\s*)?我(?:无法|不能)(?:提供|给到|协助|帮助|回答|满足).{0,80}(?:内容|请求|问题|服务)/iu,
+  /(?:抱歉|对不起).{0,80}(?:安全|政策|规范|无法|不能)/iu,
+  /(?:违反|不符合).{0,80}(?:安全|政策|规范|准则)/iu,
+];
+
+function getModelSafetyRefusalSignals(content) {
+  const answer = getAssistantText(content);
+  return {
+    answer,
+    signals: MODEL_SAFETY_REFUSAL_PATTERNS
+      .map((pattern, index) => (pattern.test(answer) ? `pattern-${index + 1}` : null))
+      .filter(Boolean),
+  };
+}
+
+function stringifySafetyTrace(value) {
+  const seen = new WeakSet();
+  return JSON.stringify(value, (_key, current) => {
+    if (typeof current === "bigint") {
+      return current.toString();
+    }
+    if (current && typeof current === "object") {
+      if (seen.has(current)) {
+        return "[Circular]";
+      }
+      seen.add(current);
+    }
+    return current;
+  });
+}
+
+async function writeModelSafetyTrace({ ctx, request, response, assistantMessage, answer, signals }) {
+  try {
+    await fs.promises.mkdir(MODEL_SAFETY_TRACE_DIR, { recursive: true, mode: 0o700 });
+    const trace = {
+      event: "model-safety-refusal",
+      timestamp: new Date().toISOString(),
+      chatId: ctx?.chat?.id ?? null,
+      userId: ctx?.from?.id ?? null,
+      signals,
+      answer,
+      request,
+      response,
+      assistantMessage,
+    };
+    await fs.promises.appendFile(
+      MODEL_SAFETY_TRACE_FILE,
+      `${stringifySafetyTrace(trace)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    await fs.promises.chmod(MODEL_SAFETY_TRACE_FILE, 0o600);
+  } catch (error) {
+    console.error("写入模型安全输出追踪日志失败:", error.message);
+  }
+}
+
 async function runModelWithTools(
   ctx,
   messages,
@@ -1876,6 +2019,7 @@ async function runModelWithTools(
 ) {
   const conversation = [...messages];
   let deliveredImage = false;
+  const imageGenerationState = { used: false };
   let activeMcdContext = mcdContext;
   let ownsMcdContext = false;
 
@@ -1907,6 +2051,11 @@ async function runModelWithTools(
         request.tools = tools;
         request.tool_choice = "auto";
       }
+      // Seed 2.0 的 OpenAI 兼容接口使用该字段关闭深度思考。只传给主
+      // 文本模型，避免让独立视觉提供商收到其不支持的供应商私有参数。
+      if (!OPENAI_THINKING_ENABLED && model === TEXT_MODEL) {
+        request.thinking = { type: "disabled" };
+      }
 
       const response = await client.chat.completions.create(request);
       const assistantMessage = response.choices[0]?.message;
@@ -1928,6 +2077,17 @@ async function runModelWithTools(
 
       if (toolCalls.length === 0) {
         const answer = getAssistantText(assistantMessage.content);
+        const safetyRefusal = getModelSafetyRefusalSignals(assistantMessage.content);
+        if (safetyRefusal.signals.length > 0) {
+          await writeModelSafetyTrace({
+            ctx,
+            request,
+            response,
+            assistantMessage,
+            answer: safetyRefusal.answer,
+            signals: safetyRefusal.signals,
+          });
+        }
         return {
           answer: answer || (deliveredImage ? "图片已生成并发送。" : "已完成。"),
           messages: conversation,
@@ -1955,6 +2115,7 @@ async function runModelWithTools(
         const result = await executeToolCall(ctx, toolCall, {
           imageEditReference,
           mcdContext: activeMcdContext,
+          imageGenerationState,
         });
         deliveredImage ||= result.imageDelivered === true;
         conversation.push({
@@ -2029,6 +2190,48 @@ async function downloadTelegramPhotoReference(ctx) {
     fileSize: photo?.file_size,
     fallbackMimeType: "image/jpeg",
   });
+}
+
+async function handleAdminRoleReferencePhoto(ctx, scope) {
+  if (!isAdmin(ctx) || !isPrivateChat(ctx)) {
+    return false;
+  }
+
+  const flow = await adminFlow.find(scope);
+  if (flow?.step !== "reference-upload") {
+    return false;
+  }
+
+  const role = (await getRoles()).find((item) => item.id === flow.draft?.roleId);
+  if (!role?.id) {
+    await adminFlow.clear(scope);
+    await ctx.reply("目标角色已不存在，未保存图片。请重新发送 /admin 操作。");
+    return true;
+  }
+
+  const uploaded = await downloadTelegramPhotoReference(ctx);
+  if (!uploaded.ok) {
+    await ctx.reply(uploaded.error);
+    return true;
+  }
+
+  const saved = await saveRoleReferenceImage({
+    role,
+    scope,
+    image: uploaded.image,
+    mimeType: uploaded.mimeType,
+    source: "admin-uploaded",
+  });
+  if (!saved.ok) {
+    await ctx.reply(saved.error);
+    return true;
+  }
+
+  await adminFlow.clear(scope);
+  await ctx.reply(
+    `已将这张图片保存为「${saved.roleName}」的人设图。之后为该角色生成视频时，会自动将它作为角色参考图使用。`,
+  );
+  return true;
 }
 
 async function downloadTelegramStickerReference(ctx) {
@@ -2785,6 +2988,10 @@ bot.on(message("photo"), async (ctx) => {
   }
 
   await runInSessionQueue(scope, async () => {
+    if (await handleAdminRoleReferencePhoto(ctx, scope)) {
+      return;
+    }
+
     await handleVisualConversation(ctx, scope, {
       sourceLabel: "图片",
       caption: typeof ctx.message?.caption === "string" ? ctx.message.caption.trim() : "",
