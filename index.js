@@ -76,6 +76,9 @@ const OPENAI_THINKING_ENABLED = !["false", "0", "no", "off"].includes(
 const HAS_SEPARATE_VISION_PROVIDER = Boolean(
   process.env.OPENAI_VISION_API_KEY || process.env.OPENAI_VISION_API_BASE_URL,
 );
+const VISION_USE_TELEGRAM_FILE_URL = ["true", "1", "yes", "on"].includes(
+  String(process.env.VISION_USE_TELEGRAM_FILE_URL || "false").trim().toLowerCase(),
+);
 const DEFAULT_TOOL_SETTINGS = Object.freeze({
   timeEnabled: true,
   imageEnabled: false,
@@ -2168,6 +2171,12 @@ function getModelSafetyRefusalSignals(content) {
 function stringifySafetyTrace(value) {
   const seen = new WeakSet();
   return JSON.stringify(value, (_key, current) => {
+    if (typeof current === "string") {
+      return current.replace(
+        /(https?:\/\/api\.telegram\.org\/file\/bot)[^/?#]+/gi,
+        "$1[REDACTED]",
+      );
+    }
     if (typeof current === "bigint") {
       return current.toString();
     }
@@ -2383,7 +2392,12 @@ async function downloadTelegramImageFile(ctx, { fileId, fileSize, fallbackMimeTy
       ? headerMimeType
       : fallbackMimeType;
 
-    return { ok: true, image, mimeType };
+    return {
+      ok: true,
+      image,
+      mimeType,
+      ...(VISION_USE_TELEGRAM_FILE_URL ? { visionImageUrl: String(fileLink) } : {}),
+    };
   } catch (error) {
     console.error("下载 Telegram 图片失败:", error);
     return { ok: false, error: "下载这张图片失败，请重新上传后再试。" };
@@ -2469,7 +2483,7 @@ async function downloadTelegramStickerReference(ctx) {
   };
 }
 
-function buildVisualUserMessage({ sourceLabel, caption, image, mimeType }) {
+function buildVisualUserMessage({ sourceLabel, caption, image, mimeType, visionImageUrl = "" }) {
   const visiblePrompt = caption
     ? `用户发送了一张${sourceLabel}，并附言：“${caption}”。请先观察画面，再用当前角色口吻自然回应用户。`
     : `用户发送了一张${sourceLabel}。请先观察画面，再用当前角色口吻自然回应；可以描述画面、表达感受或询问用户想聊什么。`;
@@ -2481,11 +2495,21 @@ function buildVisualUserMessage({ sourceLabel, caption, image, mimeType }) {
       {
         type: "image_url",
         image_url: {
-          url: `data:${mimeType};base64,${image.toString("base64")}`,
-          detail: "auto",
+          url: /^https:\/\//i.test(visionImageUrl)
+            ? visionImageUrl
+            : `data:${mimeType};base64,${image.toString("base64")}`,
         },
       },
     ],
+  };
+}
+
+function buildDirectImageEditUserMessage({ sourceLabel, caption }) {
+  return {
+    role: "user",
+    content:
+      `用户发送了一张${sourceLabel}，附言：“${caption}”。` +
+      "这张图片已经作为本轮图片编辑的参考图 current 提供给工具。",
   };
 }
 
@@ -2496,7 +2520,8 @@ function buildStoredVisualMessage(sourceLabel, caption) {
 
 async function handleVisualConversation(ctx, scope, { sourceLabel, caption, download }) {
   const settings = await getToolSettings();
-  if (!settings.visionEnabled) {
+  const forceImageEdit = isLikelyImageEditIntent(caption, { hasCurrentReference: true });
+  if (!settings.visionEnabled && !forceImageEdit) {
     await ctx.reply("图片理解功能当前未开启。请联系管理员在 /admin → 功能 → 看图 中开启。");
     return;
   }
@@ -2547,14 +2572,16 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
     console.warn("读取历史图片失败:", error.message);
   }
 
-  const visualMessage = buildVisualUserMessage({
-    sourceLabel,
-    caption,
-    image: reference.image,
-    mimeType: reference.mimeType,
-  });
-  const modelMessages = [...savedMessages, visualMessage];
-  const visionRoute = getVisionModelRoute();
+  const incomingMessage = forceImageEdit
+    ? buildDirectImageEditUserMessage({ sourceLabel, caption })
+    : buildVisualUserMessage({
+        sourceLabel,
+        caption,
+        image: reference.image,
+        mimeType: reference.mimeType,
+        visionImageUrl: reference.visionImageUrl,
+      });
+  const modelMessages = [...savedMessages, incomingMessage];
   const imageEditReference = {
     referenceId: "current",
     sourceLabel,
@@ -2567,10 +2594,10 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
 
   try {
     const result = await runModelWithTools(ctx, modelMessages, {
-      ...visionRoute,
+      ...(forceImageEdit ? {} : getVisionModelRoute()),
       imageEditReference,
       imageEditHistory,
-      forceImageEdit: isLikelyImageEditIntent(caption, { hasCurrentReference: true }),
+      forceImageEdit,
     });
     const generatedMessages = result.messages.slice(modelMessages.length);
     const messagesToPersist = [
@@ -2584,9 +2611,11 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
     );
     await replyWithText(ctx, result.answer);
   } catch (error) {
-    console.error("图片理解失败:", error);
+    console.error(forceImageEdit ? "图片编辑请求失败:" : "图片理解失败:", error);
     await ctx.reply(
-      "这次没能看清图片或 sticker。请确认 OPENAI_VISION_MODEL（或回退的 OPENAI_MODEL）支持视觉输入后再试。当前对话上下文没有被清除。",
+      forceImageEdit
+        ? "这次没能启动图片编辑。请确认文本模型支持 Function Calling、图片编辑功能已开启且图片服务配置正确；当前对话上下文没有被清除。"
+        : "这次没能看清图片或 sticker。请确认 OPENAI_VISION_MODEL（或回退的 OPENAI_MODEL）支持视觉输入后再试。当前对话上下文没有被清除。",
     );
   }
 }
@@ -3076,7 +3105,7 @@ bot.command("newchat", async (ctx) => {
     await replaceActiveSession(scope, role);
     await ctx.reply(
       `已开启与「${role.name}」的新对话。直接发送消息即可；发送 /end 结束本次对话。\n\n` +
-        "若管理员已开启“看图”和“图片编辑”，可在私聊中上传参考图，并自然说明要让角色进图、换装、换场景、改背景或改画风；之后也能说“上一张再改成……”。开启“视频”后，也可以直接让角色制作一段短片。",
+        "若管理员已开启“图片编辑”，可在私聊中上传参考图，并自然说明要让角色进图、换装、换场景、改背景或改画风；之后也能说“上一张再改成……”。若想让角色看图或识别 sticker，还需开启“看图”。开启“视频”后，也可以直接让角色制作一段短片。",
     );
   });
 });
@@ -3159,7 +3188,7 @@ bot.help((ctx) => {
     : "";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“看图”和“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
+    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
       adminHelp,
   );
 });
