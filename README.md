@@ -41,7 +41,7 @@ TG_ADMIN_USER_IDS=123456789,987654321
 - 角色视频：支持 Seedance 2.0 Mini 文生视频；角色会把明确的视频创作需求转成 Function Call，先确认开拍，待后台任务完成后再把 MP4 发送到当前 Telegram 对话。
 - 图片编辑（I2I）：在已开启的私聊角色会话中，上传参考图并自然说明想怎么修改；视觉模型会在确有编辑意图时调用 `edit_reference_image`。支持换装、换场景、换背景、改画风和其他局部编辑；工具仅能使用本次消息的图片，原图不会写入本地对话数据库。内置工具会始终显示在模型的工具列表中；开关状态和本轮是否附图决定其能否执行。
 - 图片与 sticker 理解：发送普通图片或 sticker 后，机器人会将画面作为一次性视觉输入交给当前角色，并以角色口吻回应。静态 sticker 直接识别；动态或视频 sticker 会优先读取 Telegram 缩略图。原图不持久化，数据库仅保存“用户发送了什么”的文字摘要和角色回复。
-- 麦当劳中国 MCP：用户在私聊中通过 `/mcd set <MCP Token>` 配置各自独立的麦当劳账户授权。机器人通过 Streamable HTTP 发现 MCP 工具，并在用户明确询问菜单、门店、优惠券、积分、订单或外送时按需调用。
+- 麦当劳中国 MCP：用户在私聊中通过 `/mcd set <MCP Token>` 配置各自独立的麦当劳账户授权。机器人通过 Streamable HTTP 发现 MCP 工具，并在用户明确询问菜单、门店、优惠券、积分、订单或外送时按需调用。所有 MCP 返回都会按工具类型包装为 Telegram 文本卡片；支付、订单与优惠券链接会显示为安全的内联按钮，而不会直接回显原始 JSON 或裸链接。
 - 联网搜索：默认使用免密钥的 DuckDuckGo；可选接入自托管的 SearXNG。
 
 纯文字消息使用 `OPENAI_MODEL`，它必须支持 OpenAI Chat Completions 的 `tools` / `tool_calls` 协议；否则普通对话仍可用，但无法可靠执行这些函数。当前默认模型为 `deepseek-v4-pro`，并通过 `OPENAI_THINKING_ENABLED=false` 在主文本模型请求中传递 `thinking: { type: "disabled" }` 关闭深度思考。图片和 sticker 会自动改用 `OPENAI_VISION_MODEL`；未配置该项时才回退到 `OPENAI_MODEL`。

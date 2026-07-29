@@ -1918,9 +1918,7 @@ async function executeToolCall(
     try {
       await ctx.sendChatAction("typing");
       const result = await mcdContext.callTool(mcdTool.name, args);
-      const telegramDelivered = result.ok
-        ? await replyWithMcdTelegramResult(ctx, result)
-        : false;
+      const telegramDelivered = await replyWithMcdTelegramResult(ctx, result);
       return { ...result, telegramDelivered };
     } catch (error) {
       console.warn("麦当劳 MCP 工具调用失败:", error.message);
@@ -2781,10 +2779,14 @@ bot.command("mcd", async (ctx) => {
     if (["confirm", "确认"].includes(normalizedAction)) {
       const result = await mcdMcp.confirmPendingAction(scope.userId);
       if (!result.ok) {
+        if (result.result) {
+          await replyWithMcdTelegramResult(ctx, result.result);
+          return;
+        }
         await ctx.reply(result.error || "麦当劳操作未能执行。");
         return;
       }
-      await replyWithMcdTelegramResult(ctx, result.result, "麦当劳操作结果");
+      await replyWithMcdTelegramResult(ctx, result.result);
       return;
     }
 

@@ -14,6 +14,7 @@ const MCD_MUTATING_TOOLS = new Set([
   "create-order",
   "auto-bind-coupons",
   "mall-create-order",
+  "mall-create-order-physical",
 ]);
 
 function toUserKey(userId) {
@@ -173,9 +174,68 @@ const TELEGRAM_LABELS = {
   fat: "脂肪",
   carbohydrate: "碳水化合物",
   sodium: "钠",
+  energyKj: "能量（kJ）",
+  energyKcal: "能量（kcal）",
+  calcium: "钙",
+  productName: "餐品",
+  product_name: "餐品",
+  productCode: "餐品编码",
+  storeCode: "门店编码",
+  store_code: "门店编码",
+  addressId: "地址编号",
+  address_id: "地址编号",
+  fullAddress: "配送地址",
+  contactName: "联系人",
+  businessStatus: "营业状态",
+  businessStartTime: "营业开始",
+  businessEndTime: "营业结束",
+  couponCode: "优惠券编码",
+  coupon_code: "优惠券编码",
+  couponId: "优惠券编号",
+  coupon_id: "优惠券编号",
+  expiryDate: "到期日",
+  expireTime: "到期时间",
+  availablePoints: "可用积分",
+  frozenPoints: "冻结积分",
+  totalPoints: "累计积分",
+  paymentAmount: "支付金额",
+  payPoints: "支付积分",
+  orderAmount: "订单金额",
+  deliveryAddress: "配送地址",
+  reservation: "支持预约",
+  reservationOptionText: "可预约时段",
+  createdAt: "创建时间",
+  updatedAt: "更新时间",
 };
 const SENSITIVE_RESULT_KEY = /(?:token|secret|authorization|password|cookie)/i;
 const URL_RESULT_KEY = /(?:url|link|payment|pay|deeplink)/i;
+const RESULT_META_KEY = /^(?:success|code|message|datetime|traceId|trace_id)$/i;
+const MCD_TOOL_TELEGRAM_META = Object.freeze({
+  "list-nutrition-foods": { title: "餐品营养", icon: "🥗" },
+  "delivery-query-addresses": { title: "配送地址", icon: "📍" },
+  "delivery-create-address": { title: "配送地址", icon: "📍" },
+  "delivery-query-stores": { title: "可配送门店", icon: "🛵" },
+  "query-meal-assistance": { title: "助餐服务", icon: "🍟" },
+  "query-nearby-stores": { title: "附近门店", icon: "📍" },
+  "query-store-coupons": { title: "门店优惠券", icon: "🎟️" },
+  "query-meals": { title: "门店菜单", icon: "🍔" },
+  "query-meal-detail": { title: "餐品详情", icon: "🍔" },
+  "calculate-price": { title: "订单试算", icon: "🧾" },
+  "create-order": { title: "订单已创建", icon: "🛍️" },
+  "query-order": { title: "订单详情", icon: "🧾" },
+  "campaign-calendar": { title: "活动日历", icon: "📅" },
+  "available-coupons": { title: "可领取优惠券", icon: "🎟️" },
+  "auto-bind-coupons": { title: "领券结果", icon: "🎟️" },
+  "query-my-coupons": { title: "我的优惠券", icon: "🎟️" },
+  "query-my-account": { title: "麦当劳积分", icon: "⭐" },
+  "mall-points-products": { title: "积分兑换", icon: "🎁" },
+  "mall-product-detail": { title: "兑换商品详情", icon: "🎁" },
+  "mall-create-order": { title: "积分兑换结果", icon: "🎁" },
+  "mall-create-order-physical": { title: "实物兑换结果", icon: "🎁" },
+  "mall-order-list": { title: "商城订单", icon: "📦" },
+  "mall-order-detail": { title: "商城订单详情", icon: "📦" },
+  "now-time-info": { title: "当前时间", icon: "🕒" },
+});
 
 function toTelegramLabel(key) {
   if (TELEGRAM_LABELS[key]) {
@@ -212,7 +272,7 @@ function formatTelegramScalar(value) {
   if (typeof value === "boolean") {
     return value ? "是" : "否";
   }
-  return truncateText(String(value), 240);
+  return truncateText(String(value).replace(/https:\/\/[^\s<>"']+/g, "[链接见下方按钮]"), 240);
 }
 
 function summarizeTelegramObject(value) {
@@ -231,6 +291,7 @@ function summarizeTelegramObject(value) {
   );
   const entries = Object.entries(value || {})
     .filter(([key, item]) => !SENSITIVE_RESULT_KEY.test(key) && !URL_RESULT_KEY.test(key))
+    .filter(([key]) => !RESULT_META_KEY.test(key))
     .filter(([, item]) => item !== null && item !== undefined && typeof item !== "object")
     .slice(0, 4);
   const details = entries
@@ -263,6 +324,7 @@ function formatTelegramValue(value, depth = 0) {
   }
   return Object.entries(value)
     .filter(([key]) => !SENSITIVE_RESULT_KEY.test(key) && !URL_RESULT_KEY.test(key))
+    .filter(([key]) => !RESULT_META_KEY.test(key))
     .filter(([, item]) => item !== null && item !== undefined)
     .slice(0, 12)
     .map(([key, item]) => {
@@ -272,6 +334,64 @@ function formatTelegramValue(value, depth = 0) {
         : `${toTelegramLabel(key)}：${rendered}`;
     })
     .join("\n") || "-";
+}
+
+function getMcpPayload(result) {
+  if (result?.structuredContent && typeof result.structuredContent === "object") {
+    return result.structuredContent;
+  }
+  const textBlocks = (result?.content || [])
+    .filter((item) => item.type === "text" && item.text)
+    .map((item) => String(item.text));
+  return textBlocks.map(parseJsonText).find(Boolean) || null;
+}
+
+function unwrapMcpPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return payload;
+  }
+  if (payload.success === false) {
+    return { error: String(payload.message || "麦当劳服务未能完成这项操作。") };
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, "data")) {
+    const data = payload.data;
+    if (typeof data === "string") {
+      return parseJsonText(data) || data;
+    }
+    return data;
+  }
+  return payload;
+}
+
+function formatNutritionToon(text) {
+  if (typeof text !== "string") {
+    return "";
+  }
+  const match = text.match(/^\s*\[\d+\]\{([^}]+)\}:\s*\n([\s\S]*)$/);
+  if (!match) {
+    return "";
+  }
+  const fields = match[1].split(",").map((field) => field.trim());
+  const rows = match[2]
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(0, 10)
+    .map((line) => Object.fromEntries(
+      fields.map((field, index) => [field, line.split(",")[index] || ""]),
+    ));
+  if (rows.length === 0) {
+    return "";
+  }
+  return rows.map((row) => {
+    const nutrition = [
+      row.energyKcal ? `${row.energyKcal} kcal` : "",
+      row.protein ? `蛋白 ${row.protein}g` : "",
+      row.fat ? `脂肪 ${row.fat}g` : "",
+      row.carbohydrate ? `碳水 ${row.carbohydrate}g` : "",
+    ].filter(Boolean).join(" · ");
+    return [`• ${row.productName || "餐品"}`, nutrition].filter(Boolean).join("\n");
+  }).join("\n\n");
 }
 
 function collectTelegramLinks(value, links = [], seen = new Set(), keyHint = "") {
@@ -311,19 +431,26 @@ function formatMcpResultForTelegram(result, { title = "麦当劳" } = {}) {
   const textBlocks = (result?.content || [])
     .filter((item) => item.type === "text" && item.text)
     .map((item) => String(item.text));
-  const jsonBlocks = textBlocks.map(parseJsonText).filter(Boolean);
-  const data = result?.structuredContent || (jsonBlocks.length === 1 ? jsonBlocks[0] : null);
-  const body = data
-    ? formatTelegramValue(data)
-    : textBlocks.join("\n\n") || (result?.ok ? "操作已完成。" : "麦当劳 MCP 没有返回可显示的结果。");
-  const rawForLinks = data || textBlocks;
+  const remoteToolName = String(result?.remoteToolName || "");
+  const toolMeta = MCD_TOOL_TELEGRAM_META[remoteToolName];
+  const payload = getMcpPayload(result);
+  const data = unwrapMcpPayload(payload);
+  const body = remoteToolName === "list-nutrition-foods"
+    ? formatNutritionToon(data) || formatTelegramValue(data)
+    : data?.error
+      ? data.error
+      : data !== null && data !== undefined
+        ? formatTelegramValue(data)
+        : textBlocks.map((text) => formatTelegramScalar(text)).join("\n\n") ||
+          (result?.ok ? "操作已完成。" : "麦当劳服务未能完成这项操作，请稍后重试。");
+  const rawForLinks = payload || textBlocks;
   const links = collectTelegramLinks(rawForLinks).slice(0, 3);
   const inlineKeyboard = links.map((link, index) => [
     { text: getTelegramLinkLabel(link.keyHint, index), url: link.url },
   ]);
 
   return {
-    text: truncateText(`🍟 ${title}\n\n${body}`, 11_500),
+    text: truncateText(`${toolMeta?.icon || "🍟"} ${toolMeta?.title || title}\n\n${body}`, 11_500),
     ...(inlineKeyboard.length > 0
       ? { replyMarkup: { inline_keyboard: inlineKeyboard } }
       : {}),
@@ -354,6 +481,7 @@ function getConfirmationLabel(remoteToolName) {
     "create-order": "创建麦当劳订单",
     "auto-bind-coupons": "一键领取麦当劳优惠券",
     "mall-create-order": "使用积分兑换麦当劳商品券",
+    "mall-create-order-physical": "使用积分兑换麦当劳实物商品",
   };
   return labels[remoteToolName] || "执行麦当劳账户操作";
 }
@@ -497,7 +625,7 @@ function createMcDonaldsMcp({ db }) {
           name: remoteToolName,
           arguments: args,
         });
-        return normalizeMcpResult(result);
+        return { ...normalizeMcpResult(result), remoteToolName };
       },
       async close() {
         await session.close();
