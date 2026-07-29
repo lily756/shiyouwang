@@ -1,15 +1,27 @@
-const CryptoJS = require("crypto-js");
+const apiKey = "sd_81ha8i3c_mrn6uev0";
+const baseUrl = "https://vvdance.ai";
+const requestPath = "/api/v3/images/generations";
+const body = {
+  model: "seedream-5-0-lite-260128",
+  prompt: "Generate a clean city-street poster at sunrise, with crisp details and no text or logo",
+  image: [""],
+  size: "2K",
+  response_format: "url",
+  stream: false,
+  sequential_image_generation: "disabled"
+};
 
-function encryptMcdField(value, aesKey) {
-  return CryptoJS.AES.encrypt(
-    String(value),
-    CryptoJS.enc.Utf8.parse(aesKey),
-    {
-      mode: CryptoJS.mode.ECB,
-      padding: CryptoJS.pad.Pkcs7,
-    },
-  ).ciphertext.toString();
-}
+const bodyText = JSON.stringify(body);
 
-const tel = encryptMcdField("你的手机号", process.env.MCD_LOGIN_AES_KEY);
-const code = encryptMcdField("123456", process.env.MCD_LOGIN_AES_KEY);
+fetch(baseUrl + requestPath, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer " + apiKey
+  },
+  body: bodyText
+}).then(async (response) => {
+  const result = await response.json();
+  if (!response.ok) throw new Error(JSON.stringify(result));
+  console.log(result);
+});

@@ -62,12 +62,13 @@ OPENAI_VISION_API_BASE_URL=https://your-vision-provider/v1
 要启用角色图片，请在 `.env` 配置：
 
 ```dotenv
-# 推荐：Seedream 5.0 Pro，同时支持 T2I 与 I2I
+# 推荐：Seedream 5.0 Pro / Lite，同时支持 T2I 与 I2I
 IMAGE_PROVIDER=seedream
 SEEDREAM_API_BASE_URL=https://vvdance.yongmuai.com
 SEEDREAM_API_KEY=your_seedream_api_key
+# Pro：dola-seedream-5-0-pro-260628；Lite：seedream-5-0-lite-260128
 SEEDREAM_MODEL=dola-seedream-5-0-pro-260628
-# Pro 支持 1K、2K 或满足模型限制的 宽x高；默认 2K
+# Pro 支持 1K、2K；Lite 支持 2K、3K、4K；默认 2K
 SEEDREAM_IMAGE_SIZE=2K
 
 # 可选兼容路径：仅 IMAGE_PROVIDER=newapi 时使用
@@ -82,9 +83,20 @@ NEWAPI_IMAGE_EDIT_MODEL=your_newapi_image_edit_model
 NEWAPI_IMAGE_EDIT_SIZE=1024x1024
 ```
 
-修改 `.env` 后需要重启机器人；随后通过 `/admin → 功能 → 图片 → 开启` 启用。配置了 `SEEDREAM_API_KEY` 时，机器人默认选择 Seedream；也可以通过 `IMAGE_PROVIDER=seedream` 显式指定。Seedream 请求使用 `POST /api/v3/images/generations`，并读取 `data[0].url` 或 `data[0].b64_json`。
+修改 `.env` 后需要重启机器人；随后通过 `/admin → 功能 → 图片 → 开启` 启用。配置了 `SEEDREAM_API_KEY` 时，机器人默认选择 Seedream；也可以通过 `IMAGE_PROVIDER=seedream` 显式指定。Seedream 的图生图请求使用 `POST /api/v3/images/generations`，通过 `image` 数组传入参考图，并读取 `data[0].url` 或 `data[0].b64_json`。机器人会按模型自动适配参数：Lite（`seedream-5-0-lite-260128`）额外发送 `sequential_image_generation: "disabled"`，Pro（`dola-seedream-5-0-pro-260628`）不会发送该字段。
 
-图片编辑（I2I）需要通过 `/admin → 功能 → 图片编辑 → 开启` 启用，且文本模型必须支持 Function Calling。上传图片时，可直接写“让角色坐在这张图的窗边”“给她换成黑色风衣”“把背景换成雨夜东京”；机器人会跳过视觉理解模型，在首轮强制文本模型调用 `edit_reference_image`，图片字节只交给图生图工具，因此这条明确编辑路径不依赖 `OPENAI_VISION_MODEL`。之后在同一角色对话中也可以说“把上一张改成水彩画风”“让刚才那张里的角色走进咖啡店”；最近 8 张本地保存的参考图会提供给模型选择。单纯看图、评价或识别仍会走图片理解，要求 `/admin → 功能 → 看图 → 开启` 和视觉模型支持图片输入。使用 Seedream 时，机器人将 Telegram 场景图与（需要角色入镜时）角色人设图转换为 `data:image/...;base64,...` 一并传给同一个图片生成接口；使用 `IMAGE_PROVIDER=newapi` 时，机器人会按照 NewAPI 的 `POST /v1/images/edits` 文档使用 `multipart/form-data` 上传场景参考图。该接口文档限制参考图最大 4MB、提示词最大 1000 字符，默认输出尺寸为 `1024x1024`；需要更高分辨率 I2I 或“角色进入场景”这类双参考图任务时推荐使用 Seedream 2K。请只上传你有权使用的图片；模型会尽量保持未要求改变的主体与画面，但生成结果可能与参考图有差异。
+如需独立验证 Global 区域的 Seedream 5.0 Lite，可用 `test-seedream-lite.mjs`。它固定使用 `seedream-5-0-lite-260128`，默认生成一张 2K PNG，并可用重复的 `--image <HTTPS URL>` 测试最多 14 张参考图：
+
+```bash
+SEEDREAM_LITE_API_KEY=your_bearer_key node test-seedream-lite.mjs \
+  --prompt "Place the product from reference image 1 naturally in the subject's hand." \
+  --image "https://example.com/product.webp" \
+  --image "https://example.com/person.webp"
+```
+
+脚本遵循文档中的 Bearer 鉴权，不会读取或输出 `SEEDREAM_LITE_API_SECRET`；若服务实际要求 HMAC 签名，需要补充其签名请求头和原始请求体的具体规范后再实现。
+
+图片编辑（I2I）需要通过 `/admin → 功能 → 图片编辑 → 开启` 启用，且文本模型必须支持 Function Calling。上传图片时，可直接写“让角色坐在这张图的窗边”“给她换成黑色风衣”“把背景换成雨夜东京”；机器人会跳过视觉理解模型，在首轮强制文本模型调用 `edit_reference_image`，图片字节只交给图生图工具，因此这条明确编辑路径不依赖 `OPENAI_VISION_MODEL`。之后在同一角色对话中也可以说“把上一张改成水彩画风”“让刚才那张里的角色走进咖啡店”；最近 8 张本地保存的参考图会提供给模型选择。单纯看图、评价或识别仍会走图片理解，要求 `/admin → 功能 → 看图 → 开启` 和视觉模型支持图片输入。角色出现在编辑结果中时，角色人设图是不可改变的硬性风格锚点：哪怕背景是真实世界照片，角色也必须保留人设图的二次元/插画等原生画风，只做透视、遮挡和光影融合，不能变成写实人物。该场景需要 Seedream 同时接收场景图和人设图；若没有人设图或使用只支持单参考图的 NewAPI，机器人会拒绝角色入景/换装，而不会冒险生成画风跑偏的角色。请只上传你有权使用的图片；模型会尽量保持未要求改变的主体与画面，但生成结果可能与参考图有差异。
 
 图片理解需要通过 `/admin → 功能 → 看图 → 开启` 启用，且 `OPENAI_VISION_MODEL`（未设置时为 `OPENAI_MODEL`）必须支持 OpenAI Chat Completions 的视觉输入。开启后，在与机器人的私聊中直接发送图片或 sticker 即可；I2I 工具始终会显示在工具列表中，当前图片或当前角色的近期图片历史可作为参考图，但只有同时开启“图片编辑”且用户明确要求修改时才会执行。
 

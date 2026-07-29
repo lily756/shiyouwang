@@ -47,6 +47,8 @@ const SEEDREAM_API_KEY = process.env.SEEDREAM_API_KEY || "";
 const SEEDREAM_MODEL =
   process.env.SEEDREAM_MODEL || "dola-seedream-5-0-pro-260628";
 const SEEDREAM_IMAGE_SIZE = process.env.SEEDREAM_IMAGE_SIZE || "2K";
+const SEEDREAM_LITE_MODEL = "seedream-5-0-lite-260128";
+const SEEDREAM_PRO_MODEL = "dola-seedream-5-0-pro-260628";
 const SEEDANCE_API_BASE_URL =
   process.env.SEEDANCE_API_BASE_URL || "https://vvdance.ai";
 const SEEDANCE_API_TOKEN =
@@ -103,7 +105,7 @@ const TOOL_USE_SYSTEM_PROMPT = [
   "当用户要求列出、打印或介绍当前支持的工具时，必须列出当前 tools 中所有内置工具，并清楚区分“已注册/支持”和“本轮可执行”；不能因为功能开关关闭或缺少参考图而从支持列表中省略工具。",
   "当用户上传图片或指向历史图片，并明确或自然地表达要修改画面时，必须主动调用 edit_reference_image，不必等用户说出“I2I”或“调用工具”。包括让当前角色坐进/走进图片、将角色放进某个场景、给角色换装、换背景、换画风、替换元素等。新上传图使用 reference_id: current；用户说“上一张”“刚才那张”或引用运行时列出的历史图片时，使用对应 reference_id。单纯看图、评价、识别或提问但没有具体改图意图时绝不调用。",
   "save_current_role_reference_image 只会在管理员私聊且本轮上传了图片时出现；仅当管理员明确要求将这张图片保存为当前角色的设定图、参考图或角色立绘时调用。不要因为用户仅仅上传图片、要求看图或要求编辑图片而调用它。",
-  "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。画面主体包含当前角色、或用户要求角色进入参考图时，include_current_role 设为 true，以便程序附带角色人设图；编辑用户本人或与角色无关的图片则设为 false。",
+  "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。画面主体包含当前角色、或用户要求角色进入参考图时，include_current_role 设为 true，以便程序附带角色人设图；角色人设图的线条、渲染、材质和整体画风是不可改变的硬性约束，即使背景为真实照片也只能将角色以原生画风自然合成进场景，绝不能把角色转为写实或其他画风。编辑用户本人或与角色无关的图片则设为 false。",
   "仅当用户明确要求联网搜索、查询最新资讯或查找网页资料时，才调用 web_search。",
   "生活助手工具只在用户明确要求记录、记账、设定账单结算日、创建待办/提醒、保存记忆、管理库存或查询个人数据时使用；不要擅自保存隐私信息。账单结算日的“清空”表示结转归档，不得暗示历史流水被删除。",
   "创建相对时间提醒前，先调用 get_current_time 确认当前时间。主动提醒必须由用户通过 set_proactive_mode 明确同意后才可启用。",
@@ -180,6 +182,25 @@ function isNewApiConfigured() {
 
 function isSeedreamConfigured() {
   return Boolean(SEEDREAM_API_BASE_URL && SEEDREAM_API_KEY);
+}
+
+function getSeedreamModelConfig(model = SEEDREAM_MODEL) {
+  switch (model) {
+    case SEEDREAM_LITE_MODEL:
+      return {
+        name: "Seedream 5.0 Lite",
+        maxReferenceImages: 14,
+        usesSequentialImageGeneration: true,
+      };
+    case SEEDREAM_PRO_MODEL:
+      return {
+        name: "Seedream 5.0 Pro",
+        maxReferenceImages: 10,
+        usesSequentialImageGeneration: false,
+      };
+    default:
+      return null;
+  }
 }
 
 function isVideoGenerationConfigured() {
@@ -844,14 +865,22 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
     return { ok: false, error: "图片提示词不能为空且不能超过 20000 个字符。" };
   }
 
-  if (!Array.isArray(referenceImages) || referenceImages.length > 10) {
-    return { ok: false, error: "Seedream 5.0 Pro 最多支持 10 张参考图。" };
+  const modelConfig = getSeedreamModelConfig();
+  if (!modelConfig) {
+    return {
+      ok: false,
+      error: `不支持的 Seedream 模型：${SEEDREAM_MODEL}。可使用 ${SEEDREAM_LITE_MODEL} 或 ${SEEDREAM_PRO_MODEL}。`,
+    };
   }
 
-  const endpoint = new URL(
-    "api/v3/images/generations",
-    `${SEEDREAM_API_BASE_URL.replace(/\/+$/, "")}/`,
-  );
+  if (!Array.isArray(referenceImages) || referenceImages.length > modelConfig.maxReferenceImages) {
+    return {
+      ok: false,
+      error: `${modelConfig.name} 最多支持 ${modelConfig.maxReferenceImages} 张参考图。`,
+    };
+  }
+
+  const endpoint = `${SEEDREAM_API_BASE_URL.replace(/\/+$/, "")}/api/v3/images/generations`;
   const requestBody = {
     model: SEEDREAM_MODEL,
     prompt: normalizedPrompt,
@@ -860,6 +889,9 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
     response_format: "url",
     stream: false,
     output_format: "jpeg",
+    ...(modelConfig.usesSequentialImageGeneration
+      ? { sequential_image_generation: "disabled" }
+      : {}),
   };
 
   try {
@@ -991,7 +1023,7 @@ function buildReferenceImageEditPrompt({
     style: [
       "编辑类型：画风调整。",
       `画风修改：${normalizedInstruction}。`,
-      "保留人物身份、主要主体、姿势和构图；仅按要求改变视觉风格、材质、色彩或渲染方式。",
+      "保留人物身份、主要主体、姿势和构图；仅按要求改变非角色主体的视觉风格、材质、色彩或渲染方式。当前角色自身的画风不属于可修改范围。",
     ],
     general: [
       "编辑类型：通用图片编辑。",
@@ -1004,7 +1036,11 @@ function buildReferenceImageEditPrompt({
     "基于输入图片进行图像编辑。",
     activeRole ? `当前角色名为「${activeRole}」。` : "",
     roleReferenceAttached
-      ? "输入图 1 是要编辑的场景或历史图片；输入图 2 是当前角色的人设图。保留输入图 1 的场景主体，并让输入图 2 的角色以自然、符合透视和光影的方式进入画面。"
+      ? [
+          "输入图 1 是要编辑的场景或历史图片；输入图 2 是当前角色的人设图。",
+          "角色风格锁定（不可违背）：角色的面部、发型、体态、线条、上色、材质、渲染方式与整体画风必须严格继承输入图 2；不得因用户指令、背景、光线或参考图 1 而将角色变为写实、照片风、3D 或任何其他风格。",
+          "即使输入图 1 是真实世界照片，也必须保留照片背景本身的写实质感，同时将输入图 2 的角色以其原生画风自然合成进场景；只调整角色与背景之间必要的透视、遮挡、接触阴影和色温，不得重绘或风格化角色。",
+        ].join("\n")
       : "",
     ...typeInstructions[normalizedType],
     "不要添加文字、水印、Logo 或用户未要求的额外人物。",
@@ -2044,24 +2080,28 @@ async function executeToolCall(
       };
     }
 
+    let roleReference = null;
+    if (args.include_current_role === true) {
+      const loadedReference = await loadCurrentRoleReferenceImage(ctx);
+      if (!loadedReference.ok) {
+        return {
+          ok: false,
+          error: `${loadedReference.error} 为避免角色画风漂移，本次不会在缺少人设图时编辑角色。`,
+        };
+      }
+      if (getActiveImageProvider() !== "seedream") {
+        return {
+          ok: false,
+          error:
+            "当前 NewAPI 图片编辑接口只能提交一张参考图，无法同时锁定场景和角色人设。为避免角色画风漂移，本次角色入景/换装已拒绝；请切换到 Seedream。",
+        };
+      }
+      roleReference = loadedReference;
+    }
+
     imageEditState?.usedReferenceIds.add(selectedReference.referenceId);
     if (selectedReference.referenceId === "current" && imageEditReference) {
       imageEditReference.used = true;
-    }
-
-    let roleReference = null;
-    let roleReferenceWarning = "";
-    if (args.include_current_role === true) {
-      const loadedReference = await loadCurrentRoleReferenceImage(ctx);
-      if (loadedReference.ok) {
-        roleReference = loadedReference;
-        if (getActiveImageProvider() !== "seedream") {
-          roleReferenceWarning =
-            "当前 NewAPI 图片编辑接口只能使用场景参考图；已优先保留这张图片。切换到 Seedream 后可同时带入角色人设图。";
-        }
-      } else {
-        roleReferenceWarning = loadedReference.error;
-      }
     }
 
     await ctx.reply("照片先借我施一点小魔法——改好就立刻递回给你。✨");
@@ -2096,7 +2136,6 @@ async function executeToolCall(
           ...(savedHistoryReference?.ok
             ? { historyReferenceId: savedHistoryReference.referenceId }
             : {}),
-          ...(roleReferenceWarning ? { warning: roleReferenceWarning } : {}),
           caption,
         }
       : { ok: false, error: "图片已编辑，但发送到 Telegram 失败。" };
