@@ -7,6 +7,7 @@ const Datastore = require("@seald-io/nedb");
 const { createLifeAssistant } = require("./life-assistant");
 const { createMcDonaldsMcp } = require("./mcd-mcp");
 const { createAdminFlow } = require("./lib/admin-flow");
+const { createImageHistory } = require("./lib/image-history");
 const { createRoleStore } = require("./lib/role-store");
 const {
   buildConversationExport,
@@ -18,6 +19,7 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 const DATA_FILE = path.join(__dirname, "data");
 const ROLES_SEED_FILE = path.join(__dirname, "roles.json");
 const ROLE_ASSETS_DIR = path.join(__dirname, "role-assets");
+const CONVERSATION_IMAGE_ASSETS_DIR = path.join(__dirname, "conversation-image-assets");
 const MODEL_SAFETY_TRACE_DIR = path.join(__dirname, "runtime-logs");
 const MODEL_SAFETY_TRACE_FILE = path.join(
   MODEL_SAFETY_TRACE_DIR,
@@ -96,9 +98,9 @@ const TOOL_USE_SYSTEM_PROMPT = [
   "调用 generate_character_video 时必须提供 1～3 句角色口吻配文。视频采用异步任务生成：工具返回 videoQueued 时只说明已开始制作、成片会稍后发来，绝不能假称视频已生成或已发送。只有用户明确要求画面内字幕、标题、广告语或气泡文字时，才把 allow_on_screen_text 设为 true。",
   "内置工具会始终出现在当前 tools 列表中，便于准确说明机器人支持的能力；但执行前仍必须遵守本轮运行时状态、管理员开关和输入限制。",
   "当用户要求列出、打印或介绍当前支持的工具时，必须列出当前 tools 中所有内置工具，并清楚区分“已注册/支持”和“本轮可执行”；不能因为功能开关关闭或缺少参考图而从支持列表中省略工具。",
-  "edit_reference_image 虽会常驻 tools 列表，但只应在用户本轮上传了图片、图片编辑开关已开启且用户明确要求修改该图片时调用，例如换装、换场景、换背景、改画风或替换某个画面元素；单纯看图、评价或提问时绝不调用。",
+  "当用户上传图片或指向历史图片，并明确或自然地表达要修改画面时，必须主动调用 edit_reference_image，不必等用户说出“I2I”或“调用工具”。包括让当前角色坐进/走进图片、将角色放进某个场景、给角色换装、换背景、换画风、替换元素等。新上传图使用 reference_id: current；用户说“上一张”“刚才那张”或引用运行时列出的历史图片时，使用对应 reference_id。单纯看图、评价、识别或提问但没有具体改图意图时绝不调用。",
   "save_current_role_reference_image 只会在管理员私聊且本轮上传了图片时出现；仅当管理员明确要求将这张图片保存为当前角色的设定图、参考图或角色立绘时调用。不要因为用户仅仅上传图片、要求看图或要求编辑图片而调用它。",
-  "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。该工具只编辑本轮附带的图片，不能用于对话中更早的图片。",
+  "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。画面主体包含当前角色、或用户要求角色进入参考图时，include_current_role 设为 true，以便程序附带角色人设图；编辑用户本人或与角色无关的图片则设为 false。",
   "仅当用户明确要求联网搜索、查询最新资讯或查找网页资料时，才调用 web_search。",
   "生活助手工具只在用户明确要求记录、记账、设定账单结算日、创建待办/提醒、保存记忆、管理库存或查询个人数据时使用；不要擅自保存隐私信息。账单结算日的“清空”表示结转归档，不得暗示历史流水被删除。",
   "创建相对时间提醒前，先调用 get_current_time 确认当前时间。主动提醒必须由用户通过 set_proactive_mode 明确同意后才可启用。",
@@ -124,6 +126,11 @@ const visionOpenai = HAS_SEPARATE_VISION_PROVIDER
 const bot = new Telegraf(process.env.TG_BOT_TOKEN);
 const lifeAssistant = createLifeAssistant({ db, bot });
 const mcdMcp = createMcDonaldsMcp({ db });
+const imageHistory = createImageHistory({
+  db,
+  assetsDir: CONVERSATION_IMAGE_ASSETS_DIR,
+  maxBytes: MAX_IMAGE_REFERENCE_BYTES,
+});
 const roleStore = createRoleStore({
   db,
   rolesSeedFile: ROLES_SEED_FILE,
@@ -323,7 +330,10 @@ const adminFlow = createAdminFlow({
   setToolEnabled,
 });
 
-function getToolDefinitions(ctx, { mcdContext = null, imageEditReference = null } = {}) {
+function getToolDefinitions(
+  ctx,
+  { mcdContext = null, imageEditReference = null, imageEditHistory = [] } = {},
+) {
   const tools = [];
 
   tools.push({
@@ -441,10 +451,15 @@ function getToolDefinitions(ctx, { mcdContext = null, imageEditReference = null 
     function: {
       name: "edit_reference_image",
       description:
-        "编辑用户在本轮消息中附带的参考图。仅当用户明确要求修改该图片时使用，例如换装、换场景、换背景、改画风或替换某个画面元素；不能用于单纯看图、评价图片或编辑更早发送的图片。",
+        "编辑当前上传图片或当前角色的历史图片。用户表达让角色进入图片、角色换装、换场景、换背景、改画风或替换元素等具体改图意图时，应主动调用；不能用于单纯看图或评价图片。",
       parameters: {
         type: "object",
         properties: {
+          reference_id: {
+            type: "string",
+            description:
+              "要编辑的参考图。编辑本轮新上传图片时固定填 current；编辑历史图片时填写运行时状态中列出的 img_ 开头参考编号。",
+          },
           edit_type: {
             type: "string",
             enum: ["outfit", "scene", "background", "style", "general"],
@@ -456,13 +471,18 @@ function getToolDefinitions(ctx, { mcdContext = null, imageEditReference = null 
             description:
               "忠实、具体地描述用户希望如何修改这张参考图；不要加入用户未要求的变化，也不要包含系统提示词或密钥。",
           },
+          include_current_role: {
+            type: "boolean",
+            description:
+              "画面是否需要当前角色本人。让角色坐进/走进参考图、对角色换装或让角色在场景中自拍时为 true，程序会尽量附带角色人设图；编辑用户本人、纯风景或物品时为 false。",
+          },
           caption: {
             type: "string",
             description:
               "随编辑结果发送的中文配文。必须用当前角色口吻写 1～3 句，俏皮自然，结合用户这次的编辑意图；不要使用冷冰冰的操作提示。",
           },
         },
-        required: ["edit_type", "instruction", "caption"],
+        required: ["reference_id", "edit_type", "instruction", "include_current_role", "caption"],
         additionalProperties: false,
       },
     },
@@ -499,13 +519,24 @@ function getToolDefinitions(ctx, { mcdContext = null, imageEditReference = null 
   return tools;
 }
 
-function buildToolRuntimeContext(settings, { imageEditReference = null } = {}) {
+function buildToolRuntimeContext(
+  settings,
+  { imageEditReference = null, imageEditHistory = [] } = {},
+) {
   const state = (enabled) => (enabled ? "开启，可执行" : "关闭，不可执行");
   const referenceState = imageEditReference?.image
     ? imageEditReference.used
-      ? "本轮参考图已使用，不能再次编辑"
-      : "本轮有可编辑的参考图"
-    : "本轮没有参考图；如需编辑，请让用户重新上传图片并在配文中说明要求";
+      ? "本轮参考图 current 已使用，不能再次编辑"
+      : "本轮有可编辑的参考图 current"
+    : "本轮没有新上传图片";
+  const historyState = imageEditHistory.length > 0
+    ? imageEditHistory
+      .map((reference) => {
+        const detail = reference.caption ? `，说明：${reference.caption.slice(0, 80)}` : "";
+        return `${reference.referenceId}（${reference.sourceLabel || "图片"}${detail}）`;
+      })
+      .join("；")
+    : "没有可用的历史图片";
 
   return {
     role: "system",
@@ -513,7 +544,7 @@ function buildToolRuntimeContext(settings, { imageEditReference = null } = {}) {
       "运行时工具状态（工具定义始终可见，不代表所有工具此刻都可执行）：",
       `当前时间：${state(settings.timeEnabled)}。`,
       `角色图片：${state(settings.imageEnabled)}。`,
-      `图片编辑（I2I）：${state(settings.imageEditEnabled)}；${referenceState}。`,
+      `图片编辑（I2I）：${state(settings.imageEditEnabled)}；${referenceState}。历史图片：${historyState}。`,
       `角色视频：${state(settings.videoEnabled)}；默认 ${SEEDANCE_VIDEO_RESOLUTION}。`,
       `联网搜索：${state(settings.webSearchEnabled)}。`,
       `生活助手：${state(settings.lifeAssistantEnabled)}。`,
@@ -929,7 +960,12 @@ function normalizeImageEditType(value) {
     : "general";
 }
 
-function buildReferenceImageEditPrompt({ instruction, editType, roleName }) {
+function buildReferenceImageEditPrompt({
+  instruction,
+  editType,
+  roleName,
+  roleReferenceAttached = false,
+}) {
   const normalizedType = normalizeImageEditType(editType);
   const activeRole = typeof roleName === "string" ? roleName.trim().slice(0, 64) : "";
   const normalizedInstruction = typeof instruction === "string" ? instruction.trim() : "";
@@ -964,6 +1000,9 @@ function buildReferenceImageEditPrompt({ instruction, editType, roleName }) {
   return [
     "基于输入图片进行图像编辑。",
     activeRole ? `当前角色名为「${activeRole}」。` : "",
+    roleReferenceAttached
+      ? "输入图 1 是要编辑的场景或历史图片；输入图 2 是当前角色的人设图。保留输入图 1 的场景主体，并让输入图 2 的角色以自然、符合透视和光影的方式进入画面。"
+      : "",
     ...typeInstructions[normalizedType],
     "不要添加文字、水印、Logo 或用户未要求的额外人物。",
   ]
@@ -1080,6 +1119,7 @@ async function requestSeedreamReferenceImageEdit({
   instruction,
   editType,
   roleName,
+  roleReference = null,
 }) {
   if (!Buffer.isBuffer(referenceImage) || referenceImage.length === 0) {
     return { ok: false, error: "没有读取到可用的角色参考图。" };
@@ -1100,16 +1140,21 @@ async function requestSeedreamReferenceImageEdit({
   const normalizedMimeType = /^image\/(?:jpeg|png|webp)$/i.test(mimeType)
     ? mimeType.toLowerCase()
     : "image/jpeg";
+  const roleReferenceDataUrl = roleReference?.ok
+    ? toImageReferenceDataUrl(roleReference)
+    : null;
   const editPrompt = buildReferenceImageEditPrompt({
     instruction: normalizedInstruction,
     editType,
     roleName,
+    roleReferenceAttached: Boolean(roleReferenceDataUrl),
   });
 
   return requestSeedreamImage({
     prompt: editPrompt,
     referenceImages: [
       `data:${normalizedMimeType};base64,${referenceImage.toString("base64")}`,
+      ...(roleReferenceDataUrl ? [roleReferenceDataUrl] : []),
     ],
   });
 }
@@ -1290,6 +1335,93 @@ async function loadCurrentRoleReferenceImage(ctx) {
       ok: false,
       error: `角色「${activeRole.role.name}」的设定图不可读取。请管理员重新保存一张设定图。`,
     };
+  }
+}
+
+async function getImageEditHistory(scope, roleName, { excludeReferenceId = "" } = {}) {
+  const history = await imageHistory.list({ scope, roleName });
+  return history.filter((reference) => reference.referenceId !== excludeReferenceId);
+}
+
+function isLikelyImageEditIntent(text, { hasCurrentReference = false, hasHistory = false } = {}) {
+  const normalized = typeof text === "string"
+    ? text.replace(/\s+/g, "").toLowerCase()
+    : "";
+  if (!normalized) {
+    return false;
+  }
+
+  const asksToEdit = /(换装|换衣|改衣|换\S{0,3}(衣服|服装|裙子|发型|背景|场景|画风)|换成|改成|替换|p图|修图|编辑|美化|加上|加进|加到|放进|放到|放在|塞进|坐进|坐到|坐在|走进|走到|站在|站进|进入|出现在|融入|变成|合成)/.test(
+    normalized,
+  );
+  if (!asksToEdit) {
+    return false;
+  }
+
+  if (hasCurrentReference) {
+    return true;
+  }
+
+  if (!hasHistory) {
+    return false;
+  }
+
+  return /(上一张|上张|刚才那张|刚刚那张|前一张|之前那张|那张图|这张图|那张照片|这张照片|历史图片|图片里|图里|照片里)/.test(
+    normalized,
+  );
+}
+
+async function resolveImageEditReference({
+  scope,
+  roleName,
+  currentReference = null,
+  history = [],
+  referenceId,
+}) {
+  const requestedId = typeof referenceId === "string" ? referenceId.trim() : "";
+  if (!requestedId) {
+    return { ok: false, error: "请指定要编辑的图片。新上传图片请使用 current。" };
+  }
+
+  if (requestedId === "current") {
+    if (!currentReference?.image) {
+      return { ok: false, error: "本轮没有新上传图片。请从历史图片编号中选择，或重新上传图片。" };
+    }
+    return {
+      ok: true,
+      referenceId: "current",
+      sourceLabel: currentReference.sourceLabel || "本轮图片",
+      caption: currentReference.caption || "",
+      image: currentReference.image,
+      mimeType: currentReference.mimeType,
+    };
+  }
+
+  if (!history.some((reference) => reference.referenceId === requestedId)) {
+    return { ok: false, error: "这张历史图片不在当前可编辑列表中。请使用运行时列出的编号，或重新上传图片。" };
+  }
+  return imageHistory.load({ scope, roleName, referenceId: requestedId });
+}
+
+async function saveImageToCurrentHistory(ctx, { image, sourceLabel, caption }) {
+  const activeRole = await getActiveRoleForContext(ctx);
+  if (!activeRole.ok) {
+    return activeRole;
+  }
+
+  try {
+    const localImage = await readGeneratedCharacterImage(image);
+    return imageHistory.save({
+      scope: activeRole.scope,
+      roleName: activeRole.session.roleName,
+      sourceLabel,
+      caption,
+      image: localImage.image,
+      mimeType: localImage.mimeType,
+    });
+  } catch (error) {
+    console.warn("保存生成图片到历史记录失败:", error.message);
+    return { ok: false, error: "图片已发送，但未能保存为可继续编辑的历史图片。" };
   }
 }
 
@@ -1662,7 +1794,13 @@ async function deliverCharacterImage(ctx, image, rawCaption) {
 async function executeToolCall(
   ctx,
   toolCall,
-  { imageEditReference = null, mcdContext = null, imageGenerationState = null } = {},
+  {
+    imageEditReference = null,
+    imageEditHistory = [],
+    imageEditState = null,
+    mcdContext = null,
+    imageGenerationState = null,
+  } = {},
 ) {
   const parsedArguments = parseToolArguments(toolCall.function?.arguments);
   if (!parsedArguments.ok) {
@@ -1745,11 +1883,19 @@ async function executeToolCall(
     if (!delivery.delivered) {
       return { ok: false, error: "图片已生成，但发送到 Telegram 失败。" };
     }
+    const savedHistoryReference = await saveImageToCurrentHistory(ctx, {
+      image,
+      sourceLabel: "角色生成图片",
+      caption,
+    });
     if (savedRoleReference && !savedRoleReference.ok) {
       return {
         ok: true,
         imageDelivered: true,
         roleReferenceSaved: false,
+        ...(savedHistoryReference.ok
+          ? { historyReferenceId: savedHistoryReference.referenceId }
+          : {}),
         warning: savedRoleReference.error,
         caption,
       };
@@ -1761,12 +1907,18 @@ async function executeToolCall(
           roleReferenceSaved: true,
           roleName: savedRoleReference.roleName,
           roleReferenceUsed: Boolean(roleReference),
+          ...(savedHistoryReference.ok
+            ? { historyReferenceId: savedHistoryReference.referenceId }
+            : {}),
           caption,
         }
       : {
           ok: true,
           imageDelivered: true,
           roleReferenceUsed: Boolean(roleReference),
+          ...(savedHistoryReference.ok
+            ? { historyReferenceId: savedHistoryReference.referenceId }
+            : {}),
           ...(roleReferenceWarning ? { warning: roleReferenceWarning } : {}),
           caption,
         };
@@ -1859,28 +2011,64 @@ async function executeToolCall(
       return { ok: false, error: "图片编辑（I2I）功能已被管理员关闭。" };
     }
 
-    if (!imageEditReference?.image) {
+    const scope = getScope(ctx);
+    const session = scope ? await findActiveSession(scope) : null;
+    if (!scope || !session?.roleName) {
       return {
         ok: false,
-        error: "这次没有可用的参考图。请重新上传图片，并在配文说明想怎么修改。",
+        error: "请先用 /newchat 开启角色对话，再编辑图片。",
       };
     }
 
-    if (imageEditReference.used) {
+    const selectedReference = await resolveImageEditReference({
+      scope,
+      roleName: session.roleName,
+      currentReference: imageEditReference,
+      history: imageEditHistory,
+      referenceId: args.reference_id,
+    });
+    if (!selectedReference.ok) {
+      return selectedReference;
+    }
+
+    if (
+      imageEditState?.usedReferenceIds.has(selectedReference.referenceId) ||
+      (selectedReference.referenceId === "current" && imageEditReference?.used)
+    ) {
       return {
         ok: false,
-        error: "同一张参考图在本次消息中只能编辑一次；请查看刚才的结果后再上传新的参考图。",
+        error: "同一张参考图在本次消息中只能编辑一次；请查看刚才的结果后再上传新的图片或改用另一张历史图片。",
       };
     }
 
-    imageEditReference.used = true;
+    imageEditState?.usedReferenceIds.add(selectedReference.referenceId);
+    if (selectedReference.referenceId === "current" && imageEditReference) {
+      imageEditReference.used = true;
+    }
+
+    let roleReference = null;
+    let roleReferenceWarning = "";
+    if (args.include_current_role === true) {
+      const loadedReference = await loadCurrentRoleReferenceImage(ctx);
+      if (loadedReference.ok) {
+        roleReference = loadedReference;
+        if (getActiveImageProvider() !== "seedream") {
+          roleReferenceWarning =
+            "当前 NewAPI 图片编辑接口只能使用场景参考图；已优先保留这张图片。切换到 Seedream 后可同时带入角色人设图。";
+        }
+      } else {
+        roleReferenceWarning = loadedReference.error;
+      }
+    }
+
     await ctx.reply("照片先借我施一点小魔法——改好就立刻递回给你。✨");
     const image = await requestReferenceImageEdit({
-      referenceImage: imageEditReference.image,
-      mimeType: imageEditReference.mimeType,
-      roleName: imageEditReference.roleName,
+      referenceImage: selectedReference.image,
+      mimeType: selectedReference.mimeType,
+      roleName: session.roleName,
       instruction: args.instruction,
       editType: args.edit_type,
+      roleReference,
     });
     if (!image.ok) {
       return image;
@@ -1888,11 +2076,24 @@ async function executeToolCall(
 
     const caption = normalizeImageCaption(args.caption);
     const delivery = await deliverCharacterImage(ctx, image, caption);
+    const savedHistoryReference = delivery.delivered
+      ? await saveImageToCurrentHistory(ctx, {
+          image,
+          sourceLabel: "图片编辑结果",
+          caption,
+        })
+      : null;
     return delivery.delivered
       ? {
           ok: true,
           imageDelivered: true,
           editType: normalizeImageEditType(args.edit_type),
+          referenceId: selectedReference.referenceId,
+          roleReferenceUsed: getActiveImageProvider() === "seedream" && Boolean(roleReference),
+          ...(savedHistoryReference?.ok
+            ? { historyReferenceId: savedHistoryReference.referenceId }
+            : {}),
+          ...(roleReferenceWarning ? { warning: roleReferenceWarning } : {}),
           caption,
         }
       : { ok: false, error: "图片已编辑，但发送到 Telegram 失败。" };
@@ -2012,12 +2213,15 @@ async function runModelWithTools(
     client = openai,
     model = TEXT_MODEL,
     imageEditReference = null,
+    imageEditHistory = [],
+    forceImageEdit = false,
     mcdContext = null,
   } = {},
 ) {
   const conversation = [...messages];
   let deliveredImage = false;
   const imageGenerationState = { used: false };
+  const imageEditState = { usedReferenceIds: new Set() };
   let activeMcdContext = mcdContext;
   let ownsMcdContext = false;
 
@@ -2036,18 +2240,21 @@ async function runModelWithTools(
       const tools = getToolDefinitions(ctx, {
         mcdContext: activeMcdContext,
         imageEditReference,
+        imageEditHistory,
       });
       const request = {
         model,
         messages: buildModelMessages(
           conversation,
-          buildToolRuntimeContext(settings, { imageEditReference }),
+          buildToolRuntimeContext(settings, { imageEditReference, imageEditHistory }),
         ),
       };
 
       if (tools.length > 0) {
         request.tools = tools;
-        request.tool_choice = "auto";
+        request.tool_choice = forceImageEdit && round === 0
+          ? { type: "function", function: { name: "edit_reference_image" } }
+          : "auto";
       }
       // Seed 2.0 的 OpenAI 兼容接口使用该字段关闭深度思考。只传给主
       // 文本模型，避免让独立视觉提供商收到其不支持的供应商私有参数。
@@ -2112,6 +2319,8 @@ async function runModelWithTools(
       for (const toolCall of toolCalls) {
         const result = await executeToolCall(ctx, toolCall, {
           imageEditReference,
+          imageEditHistory,
+          imageEditState,
           mcdContext: activeMcdContext,
           imageGenerationState,
         });
@@ -2310,6 +2519,34 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
     return;
   }
 
+  let savedImageReference = null;
+  try {
+    const saved = await imageHistory.save({
+      scope,
+      roleName: session.roleName,
+      sourceLabel,
+      caption,
+      image: reference.image,
+      mimeType: reference.mimeType,
+    });
+    if (saved.ok) {
+      savedImageReference = saved;
+    } else {
+      console.warn("保存历史图片失败:", saved.error);
+    }
+  } catch (error) {
+    console.warn("保存历史图片失败:", error.message);
+  }
+
+  let imageEditHistory = [];
+  try {
+    imageEditHistory = await getImageEditHistory(scope, session.roleName, {
+      excludeReferenceId: savedImageReference?.referenceId || "",
+    });
+  } catch (error) {
+    console.warn("读取历史图片失败:", error.message);
+  }
+
   const visualMessage = buildVisualUserMessage({
     sourceLabel,
     caption,
@@ -2319,6 +2556,9 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
   const modelMessages = [...savedMessages, visualMessage];
   const visionRoute = getVisionModelRoute();
   const imageEditReference = {
+    referenceId: "current",
+    sourceLabel,
+    caption,
     image: reference.image,
     mimeType: reference.mimeType,
     roleName: session.roleName,
@@ -2329,6 +2569,8 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
     const result = await runModelWithTools(ctx, modelMessages, {
       ...visionRoute,
       imageEditReference,
+      imageEditHistory,
+      forceImageEdit: isLikelyImageEditIntent(caption, { hasCurrentReference: true }),
     });
     const generatedMessages = result.messages.slice(modelMessages.length);
     const messagesToPersist = [
@@ -2834,7 +3076,7 @@ bot.command("newchat", async (ctx) => {
     await replaceActiveSession(scope, role);
     await ctx.reply(
       `已开启与「${role.name}」的新对话。直接发送消息即可；发送 /end 结束本次对话。\n\n` +
-        "若管理员已开启“看图”和“图片编辑”，可在私聊中上传参考图，并自然说明要换装、换场景、改背景或改画风；开启“视频”后也可以直接让角色制作短片。",
+        "若管理员已开启“看图”和“图片编辑”，可在私聊中上传参考图，并自然说明要让角色进图、换装、换场景、改背景或改画风；之后也能说“上一张再改成……”。开启“视频”后，也可以直接让角色制作一段短片。",
     );
   });
 });
@@ -2917,7 +3159,7 @@ bot.help((ctx) => {
     : "";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“看图”和“图片编辑”，可在图片配文自然说明换装、换场景、改背景或改画风，角色会按需调用 I2I 工具。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
+    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“看图”和“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
       adminHelp,
   );
 });
@@ -2966,7 +3208,18 @@ bot.on(message("text"), async (ctx) => {
     await ctx.sendChatAction("typing");
 
     try {
-      const result = await runModelWithTools(ctx, messages);
+      let imageEditHistory = [];
+      try {
+        imageEditHistory = await getImageEditHistory(scope, session.roleName);
+      } catch (error) {
+        console.warn("读取历史图片失败:", error.message);
+      }
+      const result = await runModelWithTools(ctx, messages, {
+        imageEditHistory,
+        forceImageEdit: isLikelyImageEditIntent(text, {
+          hasHistory: imageEditHistory.length > 0,
+        }),
+      });
       await db.updateAsync(
         { _id: session._id, type: "chat-session" },
         { $set: { messages: result.messages, updatedAt: new Date().toISOString() } },
