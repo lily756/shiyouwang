@@ -49,6 +49,8 @@ TG_ADMIN_USER_IDS=123456789,987654321
 
 若模型最终回复命中常见安全拒答特征（包括“你好，我无法给到相关内容”），机器人会将这次完整模型请求与响应追加至 `runtime-logs/model-safety-traces.ndjson`。该文件是仅限本机用户读取的敏感调试日志（权限 `0600`），可能含对话、图片 data URL 和工具结果；排查完成后应妥善清理，切勿提交或外传。
 
+每次图片生成、图片编辑或视频生成会在 `runtime-logs/generation-tasks.ndjson` 追加任务生命周期日志（入队、开始、提交、发送成功或失败）。日志权限同样为 `0600`，含角色名、提示词/编辑说明及任务错误摘要，但不记录 API Key、图片二进制或 Telegram 文件 URL。
+
 ```dotenv
 # 仅图片 / sticker 使用的全模态模型；可与 OPENAI_MODEL 使用同一个服务
 OPENAI_VISION_MODEL=your_vision_model

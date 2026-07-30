@@ -25,6 +25,10 @@ const MODEL_SAFETY_TRACE_FILE = path.join(
   MODEL_SAFETY_TRACE_DIR,
   "model-safety-traces.ndjson",
 );
+const GENERATION_TASK_LOG_FILE = path.join(
+  MODEL_SAFETY_TRACE_DIR,
+  "generation-tasks.ndjson",
+);
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const MAX_TOOL_ROUNDS = 4;
 const ADMIN_USER_IDS = new Set(
@@ -173,6 +177,25 @@ function isAdmin(ctx) {
 
 function isPrivateChat(ctx) {
   return ctx.chat?.type === "private";
+}
+
+async function writeGenerationTaskLog(event, details = {}) {
+  try {
+    await fs.promises.mkdir(MODEL_SAFETY_TRACE_DIR, { recursive: true, mode: 0o700 });
+    const entry = {
+      event,
+      timestamp: new Date().toISOString(),
+      ...details,
+    };
+    await fs.promises.appendFile(
+      GENERATION_TASK_LOG_FILE,
+      `${JSON.stringify(entry)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    await fs.promises.chmod(GENERATION_TASK_LOG_FILE, 0o600);
+  } catch (error) {
+    console.error("写入生成任务日志失败:", error.message);
+  }
 }
 
 function getCommandArgument(ctx, command) {
@@ -1746,6 +1769,16 @@ async function processVideoTaskDelivery(taskRecordId) {
   }
 
   if (taskRecord.status === "submitting") {
+    await writeGenerationTaskLog("video-task-submitting", {
+      taskId: taskRecord._id,
+      model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+      chatId: taskRecord.chatId,
+      userId: taskRecord.userId,
+      roleName: taskRecord.roleName,
+      prompt: taskRecord.prompt,
+      ratio: taskRecord.ratio,
+      duration: taskRecord.duration,
+    });
     const role = await getTaskRole(taskRecord.roleName);
     const roleReference = role ? await loadRoleReferenceImageForRole(role) : null;
     if (!roleReference?.ok) {
@@ -1754,6 +1787,14 @@ async function processVideoTaskDelivery(taskRecordId) {
         { _id: taskRecord._id },
         { $set: { status: "failed", failedAt: new Date().toISOString(), providerError: error } },
       );
+      await writeGenerationTaskLog("video-task-failed", {
+        taskId: taskRecord._id,
+        model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+        chatId: taskRecord.chatId,
+        userId: taskRecord.userId,
+        roleName: taskRecord.roleName,
+        error,
+      });
       await notifyVideoTaskFailure(taskRecord.chatId);
       return;
     }
@@ -1777,6 +1818,14 @@ async function processVideoTaskDelivery(taskRecordId) {
           },
         },
       );
+      await writeGenerationTaskLog("video-task-failed", {
+        taskId: taskRecord._id,
+        model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+        chatId: taskRecord.chatId,
+        userId: taskRecord.userId,
+        roleName: taskRecord.roleName,
+        error: submitted.error,
+      });
       await notifyVideoTaskFailure(taskRecord.chatId);
       return;
     }
@@ -1805,6 +1854,17 @@ async function processVideoTaskDelivery(taskRecordId) {
       duration: submitted.duration,
       roleReferenceUsed: true,
     };
+    await writeGenerationTaskLog("video-task-submitted", {
+      taskId: taskRecord._id,
+      remoteTaskId: submitted.taskId,
+      model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+      chatId: taskRecord.chatId,
+      userId: taskRecord.userId,
+      roleName: taskRecord.roleName,
+      ratio: submitted.ratio,
+      duration: submitted.duration,
+      resolution: submitted.resolution,
+    });
   }
 
   const createdAt = new Date(taskRecord.createdAt).valueOf();
@@ -1823,12 +1883,29 @@ async function processVideoTaskDelivery(taskRecordId) {
             { _id: taskRecord._id },
             { $set: { status: "delivered", videoUrl: result.videoUrl, completedAt: now } },
           );
+          await writeGenerationTaskLog("video-task-delivered", {
+            taskId: taskRecord._id,
+            remoteTaskId: taskRecord.remoteTaskId,
+            model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+            chatId: taskRecord.chatId,
+            userId: taskRecord.userId,
+            roleName: taskRecord.roleName,
+          });
         } catch (error) {
           console.error("发送角色视频失败:", error);
           await db.updateAsync(
             { _id: taskRecord._id },
             { $set: { status: "delivery-failed", videoUrl: result.videoUrl, completedAt: now } },
           );
+          await writeGenerationTaskLog("video-task-failed", {
+            taskId: taskRecord._id,
+            remoteTaskId: taskRecord.remoteTaskId,
+            model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+            chatId: taskRecord.chatId,
+            userId: taskRecord.userId,
+            roleName: taskRecord.roleName,
+            error: String(error.message || error).slice(0, 300),
+          });
           await notifyVideoTaskFailure(taskRecord.chatId);
         }
         return;
@@ -1839,6 +1916,15 @@ async function processVideoTaskDelivery(taskRecordId) {
           { _id: taskRecord._id },
           { $set: { status: "failed", failedAt: now, providerError: result.error.slice(0, 300) } },
         );
+        await writeGenerationTaskLog("video-task-failed", {
+          taskId: taskRecord._id,
+          remoteTaskId: taskRecord.remoteTaskId,
+          model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+          chatId: taskRecord.chatId,
+          userId: taskRecord.userId,
+          roleName: taskRecord.roleName,
+          error: result.error.slice(0, 300),
+        });
         await notifyVideoTaskFailure(taskRecord.chatId);
         return;
       }
@@ -1862,6 +1948,14 @@ async function processVideoTaskDelivery(taskRecordId) {
     { _id: taskRecord._id },
     { $set: { status: "timed-out", timedOutAt: new Date().toISOString() } },
   );
+  await writeGenerationTaskLog("video-task-timed-out", {
+    taskId: taskRecord._id,
+    remoteTaskId: taskRecord.remoteTaskId,
+    model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
+    chatId: taskRecord.chatId,
+    userId: taskRecord.userId,
+    roleName: taskRecord.roleName,
+  });
   await notifyVideoTaskFailure(taskRecord.chatId);
 }
 
@@ -1990,6 +2084,17 @@ async function processImageTask(taskRecordId) {
     { _id: task._id },
     { $set: { status: "processing", startedAt: new Date().toISOString() } },
   );
+  await writeGenerationTaskLog("image-task-started", {
+    taskId: task._id,
+    kind: task.kind,
+    provider: getActiveImageProvider(),
+    model: getActiveImageProvider() === "seedream" ? SEEDREAM_MODEL : NEWAPI_IMAGE_MODEL,
+    chatId: task.chatId,
+    userId: task.userId,
+    roleName: task.roleName,
+    prompt: task.kind === "edit" ? task.instruction : task.prompt,
+    referenceId: task.referenceId || null,
+  });
 
   try {
     const role = await getTaskRole(task.roleName);
@@ -2083,6 +2188,18 @@ async function processImageTask(taskRecordId) {
         },
       },
     );
+    await writeGenerationTaskLog("image-task-delivered", {
+      taskId: task._id,
+      kind: task.kind,
+      provider: getActiveImageProvider(),
+      model: getActiveImageProvider() === "seedream" ? SEEDREAM_MODEL : NEWAPI_IMAGE_MODEL,
+      chatId: task.chatId,
+      userId: task.userId,
+      roleName: task.roleName,
+      referenceId: task.referenceId || null,
+      roleReferenceUsed: Boolean(roleReference),
+      historyReferenceId: savedHistoryReference?.referenceId || null,
+    });
   } catch (error) {
     console.error("图片后台任务失败:", error);
     await db.updateAsync(
@@ -2095,6 +2212,16 @@ async function processImageTask(taskRecordId) {
         },
       },
     );
+    await writeGenerationTaskLog("image-task-failed", {
+      taskId: task._id,
+      kind: task.kind,
+      provider: getActiveImageProvider(),
+      model: getActiveImageProvider() === "seedream" ? SEEDREAM_MODEL : NEWAPI_IMAGE_MODEL,
+      chatId: task.chatId,
+      userId: task.userId,
+      roleName: task.roleName,
+      error: String(error.message || error).slice(0, 300),
+    });
     await notifyImageTaskFailure(task.chatId);
   }
 }
@@ -2187,6 +2314,18 @@ async function executeToolCall(
       status: "queued",
       createdAt: now,
     });
+    await writeGenerationTaskLog("image-task-queued", {
+      taskId: taskRecord._id,
+      kind: "generate",
+      provider: getActiveImageProvider(),
+      model: getActiveImageProvider() === "seedream" ? SEEDREAM_MODEL : NEWAPI_IMAGE_MODEL,
+      chatId: scope.chatId,
+      userId: scope.userId,
+      roleName: session.roleName,
+      prompt: args.prompt,
+      includeCurrentRole: args.include_current_role === true,
+      saveAsRoleReference: args.save_as_role_reference === true,
+    });
     scheduleImageTask(taskRecord._id);
     return {
       ok: true,
@@ -2227,6 +2366,19 @@ async function executeToolCall(
       roleName: roleReference.roleName,
       roleReferenceUsed: true,
       createdAt: now,
+    });
+    await writeGenerationTaskLog("video-task-queued", {
+      taskId: taskRecord._id,
+      model: SEEDANCE_VIDEO_MODEL,
+      chatId: scope.chatId,
+      userId: scope.userId,
+      roleName: roleReference.roleName,
+      prompt: args.prompt,
+      ratio: taskRecord.ratio,
+      duration: taskRecord.duration,
+      resolution: taskRecord.resolution,
+      generateAudio: args.generate_audio,
+      allowOnScreenText: args.allow_on_screen_text === true,
     });
     scheduleVideoTaskDelivery(taskRecord._id);
     await ctx.reply("导演椅空出来啦——分镜已经递进后台，成片一好我就马上递给你。🎬");
@@ -2358,6 +2510,19 @@ async function executeToolCall(
       includeCurrentRole: args.include_current_role === true,
       status: "queued",
       createdAt: new Date().toISOString(),
+    });
+    await writeGenerationTaskLog("image-task-queued", {
+      taskId: taskRecord._id,
+      kind: "edit",
+      provider: getActiveImageProvider(),
+      model: getActiveImageProvider() === "seedream" ? SEEDREAM_MODEL : NEWAPI_IMAGE_MODEL,
+      chatId: scope.chatId,
+      userId: scope.userId,
+      roleName: session.roleName,
+      prompt: args.instruction,
+      referenceId: taskReferenceId,
+      editType: normalizeImageEditType(args.edit_type),
+      includeCurrentRole: args.include_current_role === true,
     });
     scheduleImageTask(taskRecord._id);
     return {
