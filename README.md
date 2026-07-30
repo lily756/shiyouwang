@@ -12,6 +12,7 @@ npm start
 - `/start`：保存/更新用户信息并显示用法。
 - `/list`：列出可用角色及简介。
 - `/newchat <角色名字>`：以指定角色创建新的对话；若已有对话，会被新的对话替换。
+- `/refreshprompt`（或 `/refresh`）：保留当前对话历史，仅重新载入当前角色最新的 system prompt。
 - `/export`：将当前对话的可见文本导出为 Markdown 文件；不会包含 system prompt、内部工具调用或工具返回。
 - `/end`：结束当前对话并清除这段对话的上下文。
 - `/whoami`：显示自己的 Telegram 用户 ID，可用于配置管理员。
@@ -30,7 +31,7 @@ TG_ADMIN_USER_IDS=123456789,987654321
 
 发送 `/admin` 后，按机器人提示输入“新增”“编辑”“删除”“查看”“设定图”或“功能”，即可逐步完成角色的增删改查、上传角色人设图或管理工具开关。新增或编辑角色时，机器人会依次询问名称、简介和 system prompt；发送 `/cancel` 或“取消”会退出管理流程。
 
-已开始的角色对话会保留创建时的 system prompt。管理员修改角色后，用户需要重新发送 `/newchat <角色名字>` 才会使用新设定。
+已开始的角色对话会保留创建时的 system prompt。管理员修改角色后，可发送 `/refreshprompt`（或 `/refresh`）只刷新 system prompt 并保留完整对话历史；如需同时清空历史再启用新设定，则使用 `/newchat <角色名字>`。
 
 ## Function calling 工具
 

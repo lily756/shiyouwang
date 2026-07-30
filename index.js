@@ -181,6 +181,7 @@ const {
   normalizeRole,
   replyWithMcdTelegramResult,
   replyWithText,
+  refreshActiveSessionSystemPrompt,
   replaceActiveSession,
   runInSessionQueue,
 } = roleStore;
@@ -4351,6 +4352,37 @@ bot.command("newchat", async (ctx) => {
   });
 });
 
+async function refreshCurrentSessionPrompt(ctx) {
+  const scope = getScope(ctx);
+  if (!scope) {
+    return;
+  }
+
+  await runInSessionQueue(scope, async () => {
+    const session = await findActiveSession(scope);
+    if (!session?.roleName) {
+      await ctx.reply("当前没有进行中的角色对话。先用 /newchat 开始对话后再刷新设定。");
+      return;
+    }
+    const role = findRole(await getRoles(), session.roleName);
+    if (!role) {
+      await ctx.reply(`当前角色「${session.roleName}」已不存在，无法刷新设定。`);
+      return;
+    }
+    const refreshed = await refreshActiveSessionSystemPrompt(scope, role);
+    if (!refreshed.ok) {
+      await ctx.reply(refreshed.error);
+      return;
+    }
+    await ctx.reply(
+      `已刷新「${role.name}」的 system prompt；之前的对话消息和上下文均已保留。`,
+    );
+  });
+}
+
+bot.command("refreshprompt", refreshCurrentSessionPrompt);
+bot.command("refresh", refreshCurrentSessionPrompt);
+
 bot.command("export", async (ctx) => {
   const scope = getScope(ctx);
   if (!scope) {
@@ -4429,7 +4461,7 @@ bot.help((ctx) => {
     : "";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；明确说“参考刚才视频的动作/运镜生成……”时才会使用，最多 3 段。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
+    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；明确说“参考刚才视频的动作/运镜生成……”时才会使用，最多 3 段。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
       adminHelp,
   );
 });
