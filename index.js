@@ -101,7 +101,7 @@ const TOOL_USE_SYSTEM_PROMPT = [
   "除非用户明确表示不要图片，当当前角色刚换装、来到漂亮或有故事感的场景、发生自然的自拍/打卡/纪念瞬间，或对话中出现其他确实值得用一张照片记录的具体画面时，主动调用 generate_character_image，把照片直接发给用户。每条用户消息至多主动生成一张；不要因为抽象感慨、普通寒暄、知识问答或只有一个形容词就滥用图片。",
   "调用 generate_character_image 或 edit_reference_image 时，必须同时提供 progress_message 和 caption。progress_message 是图片任务开始前立刻发出的 1～2 句角色台词，必须结合本轮上下文、自然俏皮，不能写固定的‘正在生成/正在编辑’操作提示；caption 是随成图发送的 1～3 句配文，两者不要机械重复。图片发送成功后，继续用角色口吻接住用户的话题。",
   "图片和视频均采用后台任务。工具结果标记 imageQueued 或 videoQueued 时，只能说明已开始处理、成品会稍后主动发送；绝不能假称图片或视频已经生成、已经发送，或重复 progress_message。",
-  "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会优先使用已保存的人设图保持角色的面部、发型和 2D 画风。若画面只是纯风景、物品、食物或与角色本人无关的内容，设为 false，不能强行让角色入镜。",
+  "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会直接附带已保存的人设图来锁定角色的面部、发型和 2D 画风。只有用户明确要求纯风景、纯物品、纯食物或画面中不要人物/角色时，才能设为 false；不要因为提示词没有重复角色名就设为 false。",
   "仅当管理员在私聊中明确要求生成、创建或更新当前角色的“设定图/参考图/角色立绘”时，才把 generate_character_image 的 save_as_role_reference 设为 true；这会把生成图保存为全局角色资产，供后续视频锁定角色身份和画风。普通场景图、壁纸或随手图片绝不能覆盖角色设定图。",
   "仅当用户明确要求生成、制作或创作当前角色的视频/动态短片时，才调用 generate_character_video。该工具会自动把当前角色已保存的设定图作为唯一的 @图片1 参考素材（reference_image），用于锁定角色身份与画风，而不是限定视频首帧；不要在 prompt 中自行编造其他 @图片N、@视频N、@音频N 或 Asset ID。若工具提示当前角色没有设定图，应请管理员先生成或上传并保存设定图。",
   "调用 generate_character_video 前，先判断用户是否至少给出了主体和核心动作；如果只是一句高度概括的想法且缺少这两项，应先用角色口吻追问，不要擅自编造。信息足够时，将用户意图改写为 Seedance 工程化中文提示词：简单单场景用一段式写清主体、连续细节动作、场景、光影/风格和单一运镜；有多个事件或场景时用“镜头1/镜头2 …”按顺序写分镜，不写绝对秒数，每个镜头只保留一种运镜。程序会自动加入 @图片1 的角色参考绑定，以及画质、稳定和文字/水印约束。",
@@ -111,7 +111,7 @@ const TOOL_USE_SYSTEM_PROMPT = [
   "当用户要求列出、打印或介绍当前支持的工具时，必须列出当前 tools 中所有内置工具，并清楚区分“已注册/支持”和“本轮可执行”；不能因为功能开关关闭或缺少参考图而从支持列表中省略工具。",
   "当用户上传图片或指向历史图片，并明确或自然地表达要修改画面时，必须主动调用 edit_reference_image，不必等用户说出“I2I”或“调用工具”。包括让当前角色坐进/走进图片、将角色放进某个场景、给角色换装、换背景、换画风、替换元素等。新上传图使用 reference_id: current；用户说“上一张”“刚才那张”或引用运行时列出的历史图片时，使用对应 reference_id。单纯看图、评价、识别或提问但没有具体改图意图时绝不调用。",
   "save_current_role_reference_image 只会在管理员私聊且本轮上传了图片时出现；仅当管理员明确要求将这张图片保存为当前角色的设定图、参考图或角色立绘时调用。不要因为用户仅仅上传图片、要求看图或要求编辑图片而调用它。",
-  "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。画面主体包含当前角色、或用户要求角色进入参考图时，include_current_role 设为 true，以便程序附带角色人设图；角色人设图的线条、渲染、材质和整体画风是不可改变的硬性约束，即使背景为真实照片也只能将角色以原生画风自然合成进场景，绝不能把角色转为写实或其他画风。编辑用户本人或与角色无关的图片则设为 false。",
+  "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。画面主体包含当前角色、或用户要求角色进入参考图时，include_current_role 必须设为 true，以便程序直接附带角色人设图；角色人设图的线条、渲染、材质和整体画风是不可改变的硬性约束，即使背景为真实照片也只能将角色以原生画风自然合成进场景，绝不能把角色转为写实或其他画风。仅编辑用户本人或明确与角色无关的图片时才能设为 false。",
   "仅当用户明确要求联网搜索、查询最新资讯或查找网页资料时，才调用 web_search。",
   "生活助手工具只在用户明确要求记录、记账、设定账单结算日、创建待办/提醒、保存记忆、管理库存或查询个人数据时使用；不要擅自保存隐私信息。账单结算日的“清空”表示结转归档，不得暗示历史流水被删除。",
   "创建相对时间提醒前，先调用 get_current_time 确认当前时间。主动提醒必须由用户通过 set_proactive_mode 明确同意后才可启用。",
@@ -489,7 +489,7 @@ function getToolDefinitions(
           include_current_role: {
             type: "boolean",
             description:
-              "画面主体是否包含当前角色本人。自拍、换装照、角色在景点打卡或角色参与的场景设为 true，程序会优先带入该角色已保存的人设图；纯风景、物品、食物或与角色无关的图设为 false。",
+              "画面主体是否包含当前角色本人。自拍、换装照、角色在景点打卡或角色参与的场景必须设为 true，程序会直接带入该角色已保存的人设图；只有用户明确要求纯风景、物品、食物或不要人物时才设为 false。",
           },
           save_as_role_reference: {
             type: "boolean",
@@ -531,7 +531,7 @@ function getToolDefinitions(
           include_current_role: {
             type: "boolean",
             description:
-              "画面是否需要当前角色本人。让角色坐进/走进参考图、对角色换装或让角色在场景中自拍时为 true，程序会尽量附带角色人设图；编辑用户本人、纯风景或物品时为 false。",
+              "画面是否需要当前角色本人。让角色坐进/走进参考图、对角色换装或让角色在场景中自拍时必须为 true，程序会直接附带角色人设图；仅编辑用户本人、纯风景或物品时为 false。",
           },
           caption: {
             type: "string",
@@ -939,6 +939,17 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
       : {}),
   };
 
+  await writeGenerationTaskLog("seedream-image-request", {
+    provider: "seedream",
+    model: SEEDREAM_MODEL,
+    size: SEEDREAM_IMAGE_SIZE,
+    referenceImageCount: referenceImages.length,
+    referenceImageKinds: referenceImages.map((reference) =>
+      /^data:image\//i.test(String(reference)) ? "data-url" : "remote-url",
+    ),
+    prompt: normalizedPrompt,
+  });
+
   try {
     const response = await fetch(endpoint, {
       method: "POST",
@@ -966,15 +977,33 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
 
     const image = payload?.data?.[0];
     if (typeof image?.url === "string" && image.url) {
+      await writeGenerationTaskLog("seedream-image-response", {
+        provider: "seedream",
+        model: SEEDREAM_MODEL,
+        referenceImageCount: referenceImages.length,
+        result: "url",
+      });
       return { ok: true, url: image.url };
     }
     if (typeof image?.b64_json === "string" && image.b64_json) {
+      await writeGenerationTaskLog("seedream-image-response", {
+        provider: "seedream",
+        model: SEEDREAM_MODEL,
+        referenceImageCount: referenceImages.length,
+        result: "b64_json",
+      });
       return { ok: true, b64Json: image.b64_json };
     }
 
     throw new Error("Seedream 没有返回图片 URL 或 b64_json。");
   } catch (error) {
     console.error("Seedream 图片生成失败:", error);
+    await writeGenerationTaskLog("seedream-image-failed", {
+      provider: "seedream",
+      model: SEEDREAM_MODEL,
+      referenceImageCount: referenceImages.length,
+      error: String(error.message || error).slice(0, 300),
+    });
     return {
       ok: false,
       error: "Seedream 图片生成失败，请检查配置、模型权限或余额后重试。",
@@ -2071,6 +2100,37 @@ async function getTaskRole(roleName) {
   return role?.id ? role : null;
 }
 
+function isExplicitlyRoleIndependentImageRequest(text) {
+  const normalized = typeof text === "string"
+    ? text.replace(/\s+/g, "").toLocaleLowerCase()
+    : "";
+  if (!normalized) {
+    return false;
+  }
+
+  return /(?:纯|仅|只要|不要|不含|无|没有).{0,8}(?:角色|人物|人像|人类|男|女|她|他)|(?:纯风景|风景壁纸|产品图|商品图|食物特写|物品特写|无人物)/u.test(
+    normalized,
+  );
+}
+
+function shouldAttachRoleReference(task) {
+  if (task.saveAsRoleReference === true || task.includeCurrentRole === true) {
+    return true;
+  }
+
+  if (task.kind === "generate") {
+    // A generated image in an active role conversation is presumed to depict
+    // that role unless the request explicitly excludes people/characters.
+    return !isExplicitlyRoleIndependentImageRequest(task.prompt);
+  }
+
+  // Do not inject the role into an unrelated user photo just because it is an
+  // edit task. The model must still identify role-in-scene / outfit edits.
+  return /(?:当前角色|角色|人设|换装|换衣|服装|发型|她|他|本人)/u.test(
+    String(task.instruction || ""),
+  );
+}
+
 async function processImageTask(taskRecordId) {
   const task = await db.findOneAsync({
     _id: taskRecordId,
@@ -2104,11 +2164,12 @@ async function processImageTask(taskRecordId) {
 
     let image;
     let roleReference = null;
-    if (task.includeCurrentRole === true || task.saveAsRoleReference === true) {
+    const shouldUseRoleReference = shouldAttachRoleReference(task);
+    if (shouldUseRoleReference) {
       const loadedReference = await loadRoleReferenceImageForRole(role);
       if (loadedReference.ok) {
         roleReference = loadedReference;
-      } else if (task.kind === "edit") {
+      } else if (task.kind === "edit" || task.includeCurrentRole === true) {
         throw new Error(loadedReference.error);
       }
     }
@@ -2198,6 +2259,7 @@ async function processImageTask(taskRecordId) {
       roleName: task.roleName,
       referenceId: task.referenceId || null,
       roleReferenceUsed: Boolean(roleReference),
+      roleReferenceRequested: shouldUseRoleReference,
       historyReferenceId: savedHistoryReference?.referenceId || null,
     });
   } catch (error) {
