@@ -16,6 +16,13 @@ const {
   buildConversationExport,
   createConversationExportFilename,
 } = require("./conversation-export");
+const {
+  normalizeMediaPromptMode,
+  buildRoleReferenceImagePrompt: buildRoleReferenceImagePromptForMode,
+  buildReferenceImageEditPrompt: buildReferenceImageEditPromptForMode,
+  buildSeedanceVideoPrompt: buildSeedanceVideoPromptForMode,
+  getMediaPromptSystemInstruction,
+} = require("./lib/media-prompt");
 
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
@@ -49,6 +56,7 @@ const NEWAPI_IMAGE_EDIT_MODEL =
   process.env.NEWAPI_IMAGE_EDIT_MODEL || NEWAPI_IMAGE_MODEL;
 const NEWAPI_IMAGE_SIZE = process.env.NEWAPI_IMAGE_SIZE || "1080x1920";
 const NEWAPI_IMAGE_EDIT_SIZE = process.env.NEWAPI_IMAGE_EDIT_SIZE || "1024x1024";
+const IMAGE_ASPECT_RATIOS = Object.freeze(["1:1", "3:4", "4:3", "9:16", "16:9"]);
 const SEEDREAM_API_BASE_URL =
   process.env.SEEDREAM_API_BASE_URL || "https://vvdance.yongmuai.com";
 const SEEDREAM_API_KEY = process.env.SEEDREAM_API_KEY || "";
@@ -73,6 +81,9 @@ const VIDEO_DURATION_OPTIONS = Object.freeze([
 const SEEDANCE_VIDEO_GENERATE_AUDIO = !["false", "0", "no"].includes(
   String(process.env.SEEDANCE_VIDEO_GENERATE_AUDIO || "true").trim().toLowerCase(),
 );
+// freeform leaves the model-generated media prompt authoritative. Set guided
+// to retain the older server-side prompt expansion and style constraints.
+const MEDIA_PROMPT_MODE = normalizeMediaPromptMode(process.env.MEDIA_PROMPT_MODE);
 const IMAGE_PROVIDER = (
   process.env.IMAGE_PROVIDER || (SEEDREAM_API_KEY ? "seedream" : "newapi")
 )
@@ -118,21 +129,30 @@ const DEFAULT_TOOL_SETTINGS = Object.freeze({
 });
 const TOOL_USE_SYSTEM_PROMPT = [
   "你正在进行角色对话，并且可能有工具可用。",
+  getMediaPromptSystemInstruction(MEDIA_PROMPT_MODE),
   "当用户需要准确的当前时间时，必须调用 get_current_time，不能凭记忆猜测。",
   "除非用户明确表示不要图片，当当前角色刚换装、来到漂亮或有故事感的场景、发生自然的自拍/打卡/纪念瞬间，或对话中出现其他确实值得用一张照片记录的具体画面时，主动调用 generate_character_image，把照片直接发给用户。每条用户消息至多主动生成一张；不要因为抽象感慨、普通寒暄、知识问答或只有一个形容词就滥用图片。",
-  "调用 generate_character_image 或 edit_reference_image 时，必须同时提供 progress_message 和 caption。progress_message 是图片任务开始前立刻发出的 1～2 句角色台词，必须结合本轮上下文、自然俏皮，不能写固定的‘正在生成/正在编辑’操作提示；caption 是随成图发送的 1～3 句配文，两者不要机械重复。图片发送成功后，继续用角色口吻接住用户的话题。",
+  "调用媒体 Function 时必须同时提供 reply 和最终 prompt/instruction。reply 是立即发送给用户的角色口吻回复，应该结合本轮上下文、自然俏皮，说明已经开始准备但不要假称成品完成；caption 是可选的成品配文，progress_message 仅为旧调用兼容。所有这些文案只用于消息展示，不要混入媒体 prompt。",
   "图片和视频均采用后台任务。工具结果标记 imageQueued 或 videoQueued 时，只能说明已开始处理、成品会稍后主动发送；绝不能假称图片或视频已经生成、已经发送，或重复 progress_message。",
-  "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会直接附带已保存的人设图来锁定角色的面部、发型和参考图原生视觉风格。绝不预设为 2D、动漫或写实：人设图是什么风格，结果就保持什么风格。只有用户明确要求纯风景、纯物品、纯食物或画面中不要人物/角色时，才能设为 false；不要因为提示词没有重复角色名就设为 false。",
+  MEDIA_PROMPT_MODE === "guided"
+    ? "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会直接附带已保存的人设图来锁定角色的面部、发型和参考图原生视觉风格。绝不预设为 2D、动漫或写实：人设图是什么风格，结果就保持什么风格。只有用户明确要求纯风景、纯物品、纯食物或画面中不要人物/角色时，才能设为 false；不要因为提示词没有重复角色名就设为 false。"
+    : "freeform 模式下 include_current_role 是可选参考素材开关：只有画面确实需要当前角色并且你希望锁定其设定图时才设为 true；纯文生图、风景、物品或用户没有要求角色参考时设为 false。",
   "仅当管理员在私聊中明确要求生成、创建或更新当前角色的“设定图/参考图/角色立绘”时，才把 generate_character_image 的 save_as_role_reference 设为 true；这会把生成图保存为全局角色资产，供后续视频锁定角色身份和画风。普通场景图、壁纸或随手图片绝不能覆盖角色设定图。",
-  "仅当用户明确要求生成、制作或创作视频/动态短片时，才调用 generate_character_video。reference_ids 是按顺序传入的 0～9 张参考图：role 表示当前角色已保存的设定图，current 表示本轮上传图片，img_ 开头的编号来自运行时列出的历史图片。画面包含当前角色时，只要设定图可用就必须在 reference_ids 中加入 role；纯文生视频则传空数组 []。程序会把数组顺序映射为 @图片1、@图片2……，全部作为 reference_image（绝不是首帧）。video_reference_ids 是 0～3 段历史视频的编号，只能在用户明确要求“参考某个视频的动作、节奏、运镜或镜头语言”时填写；普通视频生成必须传 []，不能擅自用用户上传视频。它们按顺序映射为 @视频1、@视频2……并作为 reference_video。不可编造不存在的编号、@音频N 或 Asset ID。",
-  "调用 generate_character_video 前，先判断用户是否至少给出了主体和核心动作；如果只是一句高度概括的想法且缺少这两项，应先用角色口吻追问，不要擅自编造。信息足够时，将用户意图改写为 Seedance 工程化中文提示词：简单单场景用一段式写清主体、连续细节动作、场景、光影/风格和一种运镜；有多个事件或场景时用“镜头1/镜头2 …”按顺序写分镜，不写绝对秒数，每个镜头只保留一种运镜。若指定参考图或视频，在 prompt 中只能按 reference_ids 的顺序引用对应 @图片N、按 video_reference_ids 的顺序引用对应 @视频N；程序还会加入每项素材的参考用途，以及画质、稳定和文字/水印约束。",
-  "视频提示词里的音频按 Seedance 语法表达：背景音乐用（）包裹，音效用<>包裹，台词用{}包裹；台词尽量使用一种语言。仅在用户明确提出时加入画面文字，并使用对应的字幕、标题或气泡写法。",
-  "调用 generate_character_video 时必须提供 1～3 句角色口吻配文。视频采用异步任务生成：工具返回 videoQueued 时只说明已开始制作、成片会稍后发来，绝不能假称视频已生成或已发送。只有用户明确要求画面内字幕、标题、广告语或气泡文字时，才把 allow_on_screen_text 设为 true。",
+  MEDIA_PROMPT_MODE === "guided"
+    ? "仅当用户明确要求生成、制作或创作视频/动态短片时，才调用 generate_character_video。reference_ids 是按顺序传入的 0～9 张参考图：role 表示当前角色已保存的设定图，current 表示本轮上传图片，img_ 开头的编号来自运行时列出的历史图片。画面包含当前角色时，只要设定图可用就必须在 reference_ids 中加入 role；纯文生视频则传空数组 []。程序会把数组顺序映射为 @图片1、@图片2……，全部作为 reference_image（绝不是首帧）。video_reference_ids 是 0～3 段历史视频的编号，只能在用户明确要求“参考某个视频的动作、节奏、运镜或镜头语言”时填写；普通视频生成必须传 []，不能擅自用用户上传视频。它们按顺序映射为 @视频1、@视频2……并作为 reference_video。不可编造不存在的编号、@音频N 或 Asset ID。"
+    : "仅当用户明确要求生成、制作或创作视频/动态短片时，才调用 generate_character_video。reference_ids 与 video_reference_ids 是可选参考素材列表：role 表示当前角色设定图，current 表示本轮上传图片，img_/vid_ 开头的编号来自运行时列出的历史素材。只有用户或 prompt 明确需要时才加入对应素材；纯文生视频传空数组。程序会按数组顺序映射 @图片1、@图片2……和 @视频1、@视频2……，不可编造不存在的编号、@音频N 或 Asset ID。",
+  MEDIA_PROMPT_MODE === "guided"
+    ? "调用 generate_character_video 前，先判断用户是否至少给出了主体和核心动作；如果只是一句高度概括的想法且缺少这两项，应先用角色口吻追问，不要擅自编造。信息足够时，将用户意图改写为 Seedance 工程化中文提示词：简单单场景用一段式写清主体、连续细节动作、场景、光影/风格和一种运镜；有多个事件或场景时用“镜头1/镜头2 …”按顺序写分镜，不写绝对秒数，每个镜头只保留一种运镜。若指定参考图或视频，在 prompt 中只能按 reference_ids 的顺序引用对应 @图片N、按 video_reference_ids 的顺序引用对应 @视频N；程序还会加入每项素材的参考用途，以及画质、稳定和文字/水印约束。"
+    : "调用 generate_character_video 时，将用户意图改写成适合 Seedance 的完整 prompt；可以写单场景、分镜、声音、对白、镜头或任何用户需要的创意细节，不要自动补充用户没有要求的风格、镜头或画质限制。参考素材只按用户或 Function Call 明确选择的 reference_ids/video_reference_ids 使用。",
+  "视频提示词里的音频按 Seedance 语法表达是可选建议：背景音乐可用（）包裹，音效可用<>包裹，台词可用{}包裹；不要把这些格式当成对用户创意的硬性限制。",
+  "调用 generate_character_video 时 caption 是可选的 Telegram 配文。视频采用异步任务生成：工具返回 videoQueued 时只说明已开始处理、成片会稍后发来，绝不能假称视频已生成或已发送。allow_on_screen_text 只控制接口参数，不要因此改写用户 prompt。",
   "内置工具会始终出现在当前 tools 列表中，便于准确说明机器人支持的能力；但执行前仍必须遵守本轮运行时状态、管理员开关和输入限制。",
   "当用户要求列出、打印或介绍当前支持的工具时，必须列出当前 tools 中所有内置工具，并清楚区分“已注册/支持”和“本轮可执行”；不能因为功能开关关闭或缺少参考图而从支持列表中省略工具。",
   "当用户上传图片或指向历史图片，并明确或自然地表达要修改画面时，必须主动调用 edit_reference_image，不必等用户说出“I2I”或“调用工具”。包括让当前角色坐进/走进图片、将角色放进某个场景、给角色换装、换背景、换画风、替换元素等。新上传图使用 reference_id: current；用户说“上一张”“刚才那张”或引用运行时列出的历史图片时，使用对应 reference_id。单纯看图、评价、识别或提问但没有具体改图意图时绝不调用。",
   "save_current_role_reference_image 只会在管理员私聊且本轮上传了图片时出现；仅当管理员明确要求将这张图片保存为当前角色的设定图、参考图或角色立绘时调用。不要因为用户仅仅上传图片、要求看图或要求编辑图片而调用它。",
-  "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。画面主体包含当前角色、或用户要求角色进入参考图时，include_current_role 必须设为 true，以便程序直接附带角色人设图；角色人设图的线条、渲染、材质和整体画风是不可改变的硬性约束，即使背景为真实照片也只能将角色以人设图原生风格自然合成进场景。不得把人设图从其原生风格变成另一种风格（例如真人照片不可擅自动漫化，插画也不可擅自写实化）。仅编辑用户本人或明确与角色无关的图片时才能设为 false。",
+  MEDIA_PROMPT_MODE === "guided"
+    ? "调用 edit_reference_image 时，必须忠实概括用户要改的内容，选择合适的 edit_type，并提供 1～3 句当前角色口吻的俏皮 caption。画面主体包含当前角色、或用户要求角色进入参考图时，include_current_role 必须设为 true，以便程序直接附带角色人设图；角色人设图的线条、渲染、材质和整体画风是不可改变的硬性约束，即使背景为真实照片也只能将角色以人设图原生风格自然合成进场景。不得把人设图从其原生风格变成另一种风格（例如真人照片不可擅自动漫化，插画也不可擅自写实化）。仅编辑用户本人或明确与角色无关的图片时才能设为 false。"
+    : "调用 edit_reference_image 时，忠实概括用户要改的内容并选择合适的 edit_type。include_current_role 是可选的角色设定图参考开关：只有用户或 prompt 明确需要当前角色时才设为 true；不需要时设为 false。不要因为默认角色或历史上下文而自动附带人设图。",
   "仅当用户明确要求联网搜索、查询最新资讯或查找网页资料时，才调用 web_search。",
   "生活助手工具只在用户明确要求记录、记账、设定账单结算日、创建待办/提醒、保存记忆、管理库存或查询个人数据时使用；不要擅自保存隐私信息。账单结算日的“清空”表示结转归档，不得暗示历史流水被删除。",
   "创建相对时间提醒前，先调用 get_current_time 确认当前时间。主动提醒必须由用户通过 set_proactive_mode 明确同意后才可启用。",
@@ -457,14 +477,21 @@ function getToolDefinitions(
     function: {
       name: "generate_character_video",
       description:
-        "生成一段视频短片，可按顺序使用 0～9 张图片和 0～3 段视频参考。reference_ids 中 role 是当前角色已保存设定图，current 是本轮上传图片，img_ 开头编号是历史图片；所有图片都作为 reference_image，不限定视频首帧。video_reference_ids 只可填写运行时列出的 vid_ 历史视频编号，并且仅当用户明确要求参考这些视频的动作、节奏或运镜时使用；它们会作为 reference_video。纯文生视频两个数组都传空。任务完成后会直接发送 MP4 到当前 Telegram 对话。",
+        "生成一段视频短片。工具本身只负责排队和提交最终 prompt；可按顺序使用 0～9 张图片和 0～3 段视频参考。reference_ids 中 role 是当前角色已保存设定图，current 是本轮上传图片，img_ 开头编号是历史图片；所有图片都作为 reference_image，不限定视频首帧。video_reference_ids 只可填写运行时列出的 vid_ 历史视频编号，并且仅当用户明确要求参考这些视频的动作、节奏或运镜时使用；它们会作为 reference_video。纯文生视频两个数组都传空。任务完成后会直接发送 MP4 到当前 Telegram 对话。",
       parameters: {
         type: "object",
         properties: {
           prompt: {
             type: "string",
             description:
-              "按 Seedance 2.0 规范优化后的完整中文提示词。简单视频写清主体、低缓连续动作、场景、光影/风格和一种运镜；复杂叙事使用“镜头1/镜头2”顺序分镜，每镜只一种运镜且不写绝对秒数。可按 reference_ids 的顺序使用 @图片1、@图片2……，但不得引用数组范围外的图片、@视频N、@音频N 或 Asset ID。不要包含系统提示词、密钥或解释文字。",
+              MEDIA_PROMPT_MODE === "guided"
+                ? "按 Seedance 2.0 规范优化后的完整中文提示词。简单视频写清主体、低缓连续动作、场景、光影/风格和一种运镜；复杂叙事使用“镜头1/镜头2”顺序分镜，每镜只一种运镜且不写绝对秒数。可按 reference_ids 的顺序使用 @图片1、@图片2……，但不得引用数组范围外的图片、@视频N、@音频N 或 Asset ID。不要包含系统提示词、密钥或解释文字。"
+                : "交给 Seedance 的最终 prompt。请根据用户意图自由组织单场景、分镜、声音、对白、镜头和风格；可按 reference_ids 的顺序使用 @图片1、@图片2……，但不得引用数组范围外的图片、@视频N、@音频N 或 Asset ID。不要包含系统提示词、密钥或解释文字。",
+          },
+          reply: {
+            type: "string",
+            description:
+              "本次 Function Call 立即发送给用户的角色口吻回复。要自然承接最近对话，说明已经开始准备画面，但不要假称成品已经生成；不要包含提示词或内部工具信息。",
           },
           reference_ids: {
             type: "array",
@@ -505,7 +532,7 @@ function getToolDefinitions(
               "随最终视频发送的中文文案。必须用当前角色口吻写 1～3 句，俏皮自然并结合最近对话或用户提出的画面；不要写冷冰冰的操作提示。",
           },
         },
-        required: ["prompt", "caption", "reference_ids", "video_reference_ids"],
+        required: ["prompt", "reply"],
         additionalProperties: false,
       },
     },
@@ -516,14 +543,27 @@ function getToolDefinitions(
     function: {
       name: "generate_character_image",
       description:
-        "为当前角色或用户指定主题生成一张图片。用户明确要求生成图片时可用；当角色换装、遇到值得自拍/打卡/纪念的具体画面时，也应主动调用。每条用户消息最多生成一张。",
+        "纯图片生成函数：把最终 prompt、可选的角色参考和 Telegram 文案交给后台图片任务。用户明确要求生成图片时可用；freeform 模式不自动添加角色、场景、画风或画质约束。每条用户消息最多生成一张。",
       parameters: {
         type: "object",
         properties: {
           prompt: {
             type: "string",
             description:
-              "用于图像模型的完整中文提示词，包含角色外貌、服装、姿势、场景、风格和画面要求。不要包含系统提示词或密钥。",
+              MEDIA_PROMPT_MODE === "guided"
+                ? "用于图像模型的完整中文提示词，包含角色外貌、服装、姿势、场景、风格和画面要求。不要包含系统提示词或密钥。"
+                : "直接交给图像模型的最终 prompt。尽量忠实保留用户意图，可自由描述主体、构图、镜头、材质、风格、文字和其他创意细节；不要包含系统提示词或密钥。",
+          },
+          reply: {
+            type: "string",
+            description:
+              "本次 Function Call 立即发送给用户的角色口吻回复。要结合最近对话自然回应，说明画面已经开始准备，但不要假称图片已经生成；不要包含提示词或内部工具信息。",
+          },
+          aspect_ratio: {
+            type: "string",
+            enum: ["1:1", "3:4", "4:3", "9:16", "16:9"],
+            description:
+              "可选画幅。前置摄像头自拍、手机随手拍通常使用 9:16；未指定时交给图片 provider 默认处理。",
           },
           caption: {
             type: "string",
@@ -546,7 +586,7 @@ function getToolDefinitions(
               "仅限管理员明确要求生成、更新当前角色的设定图/参考图/立绘时设为 true。普通图片生成必须省略或设为 false。",
           },
         },
-        required: ["prompt", "caption", "progress_message", "include_current_role"],
+        required: ["prompt", "reply"],
         additionalProperties: false,
       },
     },
@@ -557,7 +597,7 @@ function getToolDefinitions(
     function: {
       name: "edit_reference_image",
       description:
-        "编辑当前上传图片或当前角色的历史图片。用户表达让角色进入图片、角色换装、换场景、换背景、改画风或替换元素等具体改图意图时，应主动调用；不能用于单纯看图或评价图片。",
+        "纯图片编辑函数：将用户最终的编辑 instruction 和明确选择的参考图交给后台 I2I 任务。用户表达让角色进入图片、角色换装、换场景、换背景、改画风或替换元素等具体改图意图时，应主动调用；不能用于单纯看图或评价图片。freeform 模式不会擅自补写编辑约束。",
       parameters: {
         type: "object",
         properties: {
@@ -577,6 +617,11 @@ function getToolDefinitions(
             description:
               "忠实、具体地描述用户希望如何修改这张参考图；不要加入用户未要求的变化，也不要包含系统提示词或密钥。",
           },
+          reply: {
+            type: "string",
+            description:
+              "本次 Function Call 立即发送给用户的角色口吻回复。要自然说明已经开始处理，但不要假称图片编辑已经完成；不要包含提示词或内部工具信息。",
+          },
           include_current_role: {
             type: "boolean",
             description:
@@ -593,14 +638,7 @@ function getToolDefinitions(
               "图片开始编辑前立即发送给用户的中文台词。必须用当前角色口吻写 1～2 句，结合用户这次改图意图，自然俏皮；不能使用固定套话或“正在编辑图片”等冷冰冰操作提示，且不要与最终 caption 机械重复。",
           },
         },
-        required: [
-          "reference_id",
-          "edit_type",
-          "instruction",
-          "include_current_role",
-          "caption",
-          "progress_message",
-        ],
+        required: ["reference_id", "instruction", "reply"],
         additionalProperties: false,
       },
     },
@@ -682,6 +720,7 @@ function buildToolRuntimeContext(
       `当前时间：${state(settings.timeEnabled)}。`,
       `角色图片：${state(settings.imageEnabled)}。`,
       `图片编辑（I2I）：${state(settings.imageEditEnabled)}；${referenceState}。历史图片：${historyState}。`,
+      `媒体提示词模式：${MEDIA_PROMPT_MODE}（freeform 会原样提交模型生成的 prompt；guided 会追加兼容性约束）。`,
       `角色视频：${state(settings.videoEnabled)}；默认 ${SEEDANCE_VIDEO_RESOLUTION}。${videoReferenceState}${videoMotionReferenceState}`,
       `联网搜索：${state(settings.webSearchEnabled)}。`,
       `生活助手：${state(settings.lifeAssistantEnabled)}。`,
@@ -898,7 +937,7 @@ async function searchWeb(query) {
   }
 }
 
-async function requestNewApiCharacterImage(prompt) {
+async function requestNewApiCharacterImage(prompt, { aspectRatio = "" } = {}) {
   if (!isNewApiConfigured()) {
     return {
       ok: false,
@@ -927,7 +966,7 @@ async function requestNewApiCharacterImage(prompt) {
       body: JSON.stringify({
         model: NEWAPI_IMAGE_MODEL,
         prompt: normalizedPrompt,
-        size: NEWAPI_IMAGE_SIZE,
+        size: getNewApiImageSizeForAspectRatio(aspectRatio),
         n: 1,
         response_format: "url",
       }),
@@ -965,7 +1004,7 @@ async function requestNewApiCharacterImage(prompt) {
   }
 }
 
-async function requestSeedreamImage({ prompt, referenceImages = [] }) {
+async function requestSeedreamImage({ prompt, referenceImages = [], aspectRatio = "" }) {
   if (!isSeedreamConfigured()) {
     return {
       ok: false,
@@ -998,7 +1037,7 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
     model: SEEDREAM_MODEL,
     prompt: normalizedPrompt,
     ...(referenceImages.length > 0 ? { image: referenceImages } : {}),
-    size: SEEDREAM_IMAGE_SIZE,
+    size: getSeedreamImageSizeForAspectRatio(aspectRatio),
     response_format: "url",
     stream: false,
     output_format: "jpeg",
@@ -1010,7 +1049,9 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
   await writeGenerationTaskLog("seedream-image-request", {
     provider: "seedream",
     model: SEEDREAM_MODEL,
-    size: SEEDREAM_IMAGE_SIZE,
+    mediaPromptMode: MEDIA_PROMPT_MODE,
+    size: requestBody.size,
+    aspectRatio: normalizeImageAspectRatio(aspectRatio) || null,
     referenceImageCount: referenceImages.length,
     referenceImageKinds: referenceImages.map((reference) =>
       /^data:image\//i.test(String(reference)) ? "data-url" : "remote-url",
@@ -1080,6 +1121,14 @@ async function requestSeedreamImage({ prompt, referenceImages = [] }) {
 }
 
 function buildRoleReferenceImagePrompt({ prompt, roleName, maxLength = 0 }) {
+  if (MEDIA_PROMPT_MODE === "freeform") {
+    return buildRoleReferenceImagePromptForMode({
+      prompt,
+      roleName,
+      mode: MEDIA_PROMPT_MODE,
+      maxLength,
+    });
+  }
   const normalizedPrompt = typeof prompt === "string" ? prompt.replace(/\s+/g, " ").trim() : "";
   const name = typeof roleName === "string" ? roleName.trim().slice(0, 64) : "当前角色";
   const result = [
@@ -1100,11 +1149,14 @@ function toImageReferenceDataUrl(referenceImage) {
   return `data:${normalizeRoleReferenceMimeType(referenceImage.mimeType)};base64,${referenceImage.image.toString("base64")}`;
 }
 
-async function requestCharacterImage(prompt, { roleReference = null } = {}) {
+async function requestCharacterImage(
+  prompt,
+  { roleReference = null, aspectRatio = "" } = {},
+) {
   if (!roleReference?.ok) {
     return getActiveImageProvider() === "seedream"
-      ? requestSeedreamImage({ prompt })
-      : requestNewApiCharacterImage(prompt);
+      ? requestSeedreamImage({ prompt, aspectRatio })
+      : requestNewApiCharacterImage(prompt, { aspectRatio });
   }
 
   if (getActiveImageProvider() === "seedream") {
@@ -1115,6 +1167,7 @@ async function requestCharacterImage(prompt, { roleReference = null } = {}) {
     return requestSeedreamImage({
       prompt: buildRoleReferenceImagePrompt({ prompt, roleName: roleReference.roleName }),
       referenceImages: [referenceDataUrl],
+      aspectRatio,
     });
   }
 
@@ -1128,6 +1181,7 @@ async function requestCharacterImage(prompt, { roleReference = null } = {}) {
     }),
     editType: "scene",
     roleName: roleReference.roleName,
+    aspectRatio,
   });
 }
 
@@ -1137,12 +1191,66 @@ function normalizeImageEditType(value) {
     : "general";
 }
 
+function normalizeImageAspectRatio(value) {
+  return IMAGE_ASPECT_RATIOS.includes(value) ? value : "";
+}
+
+function getSeedreamImageSizeForAspectRatio(aspectRatio) {
+  const normalized = normalizeImageAspectRatio(aspectRatio);
+  if (!normalized) {
+    return SEEDREAM_IMAGE_SIZE;
+  }
+
+  // Keep dimensions aligned to 16px and within Seedream's model-specific
+  // pixel bounds. Lite needs at least 3.6864MP; Pro stays below 4.194304MP.
+  const proSizes = {
+    "1:1": "2048x2048",
+    "3:4": "1536x2048",
+    "4:3": "2048x1536",
+    "9:16": "1152x2048",
+    "16:9": "2048x1152",
+  };
+  const liteSizes = {
+    "1:1": "2048x2048",
+    "3:4": "1728x2304",
+    "4:3": "2304x1728",
+    "9:16": "1440x2560",
+    "16:9": "2560x1440",
+  };
+  return SEEDREAM_MODEL === SEEDREAM_LITE_MODEL
+    ? liteSizes[normalized]
+    : proSizes[normalized];
+}
+
+function getNewApiImageSizeForAspectRatio(aspectRatio) {
+  const normalized = normalizeImageAspectRatio(aspectRatio);
+  if (!normalized) {
+    return NEWAPI_IMAGE_SIZE;
+  }
+  return {
+    "1:1": "1536x1536",
+    "3:4": "1152x1536",
+    "4:3": "1536x1152",
+    "9:16": "1080x1920",
+    "16:9": "1920x1080",
+  }[normalized] || NEWAPI_IMAGE_SIZE;
+}
+
 function buildReferenceImageEditPrompt({
   instruction,
   editType,
   roleName,
   roleReferenceAttached = false,
 }) {
+  if (MEDIA_PROMPT_MODE === "freeform") {
+    return buildReferenceImageEditPromptForMode({
+      instruction,
+      editType,
+      roleName,
+      roleReferenceAttached,
+      mode: MEDIA_PROMPT_MODE,
+    });
+  }
   const normalizedType = normalizeImageEditType(editType);
   const activeRole = typeof roleName === "string" ? roleName.trim().slice(0, 64) : "";
   const normalizedInstruction = typeof instruction === "string" ? instruction.trim() : "";
@@ -1197,6 +1305,7 @@ async function requestNewApiReferenceImageEdit({
   instruction,
   editType,
   roleName,
+  aspectRatio = "",
 }) {
   if (!isNewApiConfigured()) {
     return {
@@ -1249,7 +1358,12 @@ async function requestNewApiReferenceImageEdit({
   form.set("prompt", editPrompt);
   form.set("model", NEWAPI_IMAGE_EDIT_MODEL);
   form.set("n", "1");
-  form.set("size", NEWAPI_IMAGE_EDIT_SIZE);
+  form.set(
+    "size",
+    normalizeImageAspectRatio(aspectRatio)
+      ? getNewApiImageSizeForAspectRatio(aspectRatio)
+      : NEWAPI_IMAGE_EDIT_SIZE,
+  );
   form.set("response_format", "url");
 
   try {
@@ -1889,6 +2003,14 @@ function buildSeedanceVideoPrompt(
   rawPrompt,
   { allowOnScreenText = false, referenceImages = [], referenceVideos = [] } = {},
 ) {
+  if (MEDIA_PROMPT_MODE === "freeform") {
+    return buildSeedanceVideoPromptForMode(rawPrompt, {
+      mode: MEDIA_PROMPT_MODE,
+      allowOnScreenText,
+      referenceImages,
+      referenceVideos,
+    });
+  }
   const prompt = typeof rawPrompt === "string"
     ? rawPrompt.replace(/\s+/g, " ").trim()
     : "";
@@ -2166,6 +2288,7 @@ async function processVideoTaskDelivery(taskRecordId) {
   if (taskRecord.status === "submitting") {
     await writeGenerationTaskLog("video-task-submitting", {
       taskId: taskRecord._id,
+      mediaPromptMode: MEDIA_PROMPT_MODE,
       model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
       chatId: taskRecord.chatId,
       userId: taskRecord.userId,
@@ -2261,6 +2384,7 @@ async function processVideoTaskDelivery(taskRecordId) {
     };
     await writeGenerationTaskLog("video-task-submitted", {
       taskId: taskRecord._id,
+      mediaPromptMode: MEDIA_PROMPT_MODE,
       remoteTaskId: submitted.taskId,
       model: taskRecord.model || SEEDANCE_VIDEO_MODEL,
       chatId: taskRecord.chatId,
@@ -2390,6 +2514,13 @@ function normalizeImageCaption(rawCaption) {
   return caption.slice(0, 900);
 }
 
+function normalizeMediaReply(rawReply) {
+  const reply = typeof rawReply === "string"
+    ? rawReply.replace(/\s+/g, " ").trim()
+    : "";
+  return reply.slice(0, 900);
+}
+
 function normalizeImageProgressMessage(rawMessage, rawCaption, { operation }) {
   const message =
     typeof rawMessage === "string"
@@ -2496,6 +2627,13 @@ function shouldAttachRoleReference(task) {
     return true;
   }
 
+  // In freeform mode the model/user explicitly controls whether a role
+  // reference is used. This avoids silently changing a pure T2I request into
+  // a role-conditioned generation.
+  if (MEDIA_PROMPT_MODE === "freeform") {
+    return false;
+  }
+
   if (task.kind === "generate") {
     // A generated image in an active role conversation is presumed to depict
     // that role unless the request explicitly excludes people/characters.
@@ -2525,12 +2663,14 @@ async function processImageTask(taskRecordId) {
   await writeGenerationTaskLog("image-task-started", {
     taskId: task._id,
     kind: task.kind,
+    mediaPromptMode: MEDIA_PROMPT_MODE,
     provider: getActiveImageProvider(),
     model: getActiveImageProvider() === "seedream" ? SEEDREAM_MODEL : NEWAPI_IMAGE_MODEL,
     chatId: task.chatId,
     userId: task.userId,
     roleName: task.roleName,
     prompt: task.kind === "edit" ? task.instruction : task.prompt,
+    aspectRatio: task.aspectRatio || null,
     referenceId: task.referenceId || null,
   });
 
@@ -2570,7 +2710,10 @@ async function processImageTask(taskRecordId) {
         roleReference,
       });
     } else {
-      image = await requestCharacterImage(task.prompt, { roleReference });
+      image = await requestCharacterImage(task.prompt, {
+        roleReference,
+        aspectRatio: task.aspectRatio,
+      });
     }
 
     if (!image?.ok) {
@@ -2736,8 +2879,9 @@ async function executeToolCall(
       return { ok: false, error: "请先用 /newchat 开启角色对话，再生成图片。" };
     }
 
+    const assistantReply = normalizeMediaReply(args.reply);
     await ctx.reply(
-      normalizeImageProgressMessage(args.progress_message, args.caption, {
+      assistantReply || normalizeImageProgressMessage(args.progress_message, args.caption, {
         operation: "generate",
       }),
     );
@@ -2749,6 +2893,7 @@ async function executeToolCall(
       chatId: scope.chatId,
       roleName: session.roleName,
       prompt: args.prompt,
+      aspectRatio: normalizeImageAspectRatio(args.aspect_ratio),
       caption: normalizeImageCaption(args.caption),
       includeCurrentRole: args.include_current_role === true,
       saveAsRoleReference: args.save_as_role_reference === true,
@@ -2758,12 +2903,14 @@ async function executeToolCall(
     await writeGenerationTaskLog("image-task-queued", {
       taskId: taskRecord._id,
       kind: "generate",
+      mediaPromptMode: MEDIA_PROMPT_MODE,
       provider: getActiveImageProvider(),
       model: getActiveImageProvider() === "seedream" ? SEEDREAM_MODEL : NEWAPI_IMAGE_MODEL,
       chatId: scope.chatId,
       userId: scope.userId,
       roleName: session.roleName,
       prompt: args.prompt,
+      aspectRatio: normalizeImageAspectRatio(args.aspect_ratio) || null,
       includeCurrentRole: args.include_current_role === true,
       saveAsRoleReference: args.save_as_role_reference === true,
     });
@@ -2771,6 +2918,9 @@ async function executeToolCall(
     return {
       ok: true,
       imageQueued: true,
+      ...(assistantReply
+        ? { assistantReply, terminalResponse: true }
+        : {}),
       taskId: taskRecord._id,
       roleName: session.roleName,
     };
@@ -2795,13 +2945,14 @@ async function executeToolCall(
       currentReference: imageEditReference,
       history: imageEditHistory,
       videoReferenceHistory,
-      referenceIds: args.reference_ids,
-      videoReferenceIds: args.video_reference_ids,
+      referenceIds: args.reference_ids || [],
+      videoReferenceIds: args.video_reference_ids || [],
     });
     if (!selectedReferences.ok) {
       return selectedReferences;
     }
 
+    const assistantReply = normalizeMediaReply(args.reply);
     const now = new Date().toISOString();
     const taskRecord = await db.insertAsync({
       type: "video-generation-task",
@@ -2826,6 +2977,7 @@ async function executeToolCall(
     });
     await writeGenerationTaskLog("video-task-queued", {
       taskId: taskRecord._id,
+      mediaPromptMode: MEDIA_PROMPT_MODE,
       model: SEEDANCE_VIDEO_MODEL,
       chatId: scope.chatId,
       userId: scope.userId,
@@ -2841,10 +2993,15 @@ async function executeToolCall(
       roleReferenceUsed: selectedReferences.roleReferenceUsed,
     });
     scheduleVideoTaskDelivery(taskRecord._id);
-    await ctx.reply("导演椅空出来啦——分镜已经递进后台，成片一好我就马上递给你。🎬");
+    await ctx.reply(
+      assistantReply || "导演椅空出来啦——分镜已经递进后台，成片一好我就马上递给你。🎬",
+    );
     return {
       ok: true,
       videoQueued: true,
+      ...(assistantReply
+        ? { assistantReply, terminalResponse: true }
+        : {}),
       taskId: taskRecord._id,
       resolution: taskRecord.resolution,
       ratio: taskRecord.ratio,
@@ -2954,8 +3111,9 @@ async function executeToolCall(
       taskReferenceId = savedReference.referenceId;
     }
 
+    const assistantReply = normalizeMediaReply(args.reply);
     await ctx.reply(
-      normalizeImageProgressMessage(args.progress_message, args.caption, {
+      assistantReply || normalizeImageProgressMessage(args.progress_message, args.caption, {
         operation: "edit",
       }),
     );
@@ -2990,6 +3148,9 @@ async function executeToolCall(
     return {
       ok: true,
       imageQueued: true,
+      ...(assistantReply
+        ? { assistantReply, terminalResponse: true }
+        : {}),
       taskId: taskRecord._id,
       editType: normalizeImageEditType(args.edit_type),
       referenceId: taskReferenceId,
@@ -3124,6 +3285,8 @@ async function runModelWithTools(
 ) {
   const conversation = [...messages];
   let deliveredImage = false;
+  let terminalResponse = false;
+  let terminalAnswer = "";
   const imageGenerationState = { used: false };
   const imageEditState = { usedReferenceIds: new Set() };
   let activeMcdContext = mcdContext;
@@ -3181,13 +3344,14 @@ async function runModelWithTools(
       const toolCalls = (assistantMessage.tool_calls || []).filter(
         (toolCall) => toolCall.type === "function",
       );
-      conversation.push({
+      const storedAssistantMessage = {
         role: "assistant",
         content: assistantMessage.content,
         ...(toolCalls.length > 0
           ? { tool_calls: toolCalls.map(toStoredToolCall) }
           : {}),
-      });
+      };
+      conversation.push(storedAssistantMessage);
 
       if (toolCalls.length === 0) {
         const answer = getAssistantText(assistantMessage.content);
@@ -3235,11 +3399,32 @@ async function runModelWithTools(
           imageGenerationState,
         });
         deliveredImage ||= result.imageDelivered === true;
+        if (result.assistantReply) {
+          storedAssistantMessage.content = [
+            storedAssistantMessage.content,
+            result.assistantReply,
+          ].filter(Boolean).join("\n");
+          terminalAnswer ||= result.assistantReply;
+        }
+        terminalResponse ||= result.terminalResponse === true;
+        const {
+          assistantReply: _assistantReply,
+          terminalResponse: _terminalResponse,
+          ...toolResult
+        } = result;
         conversation.push({
           role: "tool",
           tool_call_id: toolCall.id,
-          content: JSON.stringify(result),
+          content: JSON.stringify(toolResult),
         });
+      }
+
+      if (terminalResponse) {
+        return {
+          answer: terminalAnswer,
+          messages: conversation,
+          responseAlreadySent: true,
+        };
       }
     }
   } finally {
@@ -3402,7 +3587,9 @@ async function processConversationTask(scope) {
       { $set: { status: "completed", completedAt: new Date().toISOString() } },
       { multi: true },
     );
-    await replyWithText(ctx, result.answer);
+    if (!result.responseAlreadySent && result.answer) {
+      await replyWithText(ctx, result.answer);
+    }
   } catch (error) {
     console.error("生成后台会话回复失败:", error);
     await db.updateAsync(
@@ -3845,7 +4032,9 @@ async function handleVideoReferenceUpload(ctx, scope) {
         },
       },
     );
-    await replyWithText(ctx, result.answer);
+    if (!result.responseAlreadySent && result.answer) {
+      await replyWithText(ctx, result.answer);
+    }
   } catch (error) {
     console.error("处理视频参考指令失败:", error);
     await ctx.reply("视频已经收好，但这次没能处理附言。稍后直接用文字说明如何参考它就好。 ");
@@ -3956,7 +4145,9 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
       { _id: session._id, type: "chat-session" },
       { $set: { messages: messagesToPersist, updatedAt: new Date().toISOString() } },
     );
-    await replyWithText(ctx, result.answer);
+    if (!result.responseAlreadySent && result.answer) {
+      await replyWithText(ctx, result.answer);
+    }
   } catch (error) {
     console.error(forceImageEdit ? "图片编辑请求失败:" : "图片理解失败:", error);
     await ctx.reply(
