@@ -116,11 +116,11 @@ SEEDANCE_VIDEO_MODEL=dreamina-seedance-2-0-mini-260615
 SEEDANCE_VIDEO_RESOLUTION=480p
 # 可选默认值
 SEEDANCE_VIDEO_RATIO=16:9
-SEEDANCE_VIDEO_DURATION=5
+SEEDANCE_VIDEO_DURATION=-1
 SEEDANCE_VIDEO_GENERATE_AUDIO=true
 ```
 
-重启后通过 `/admin → 功能 → 视频 → 开启` 启用。用户在角色对话中明确说“生成一段视频：……”即可触发 `generate_character_video`。默认使用 `dreamina-seedance-2-0-mini-260615` 和 480p；模型可以根据用户要求选择 16:9 或 9:16，以及 4 或 5 秒时长。机器人会提交 `POST /api/v3/contents/generations/ark/tasks`，把任务 ID 持久化到本地数据库，在后台按状态轮询；成功后通过 Telegram 主动发送 MP4。重启后仍会恢复未完成任务的轮询。
+重启后通过 `/admin → 功能 → 视频 → 开启` 启用。用户在角色对话中明确说“生成一段视频：……”即可触发 `generate_character_video`。默认使用 `dreamina-seedance-2-0-mini-260615` 和 480p；默认时长为 `-1`（由模型智能决定），也可以根据用户要求选择 16:9 或 9:16，以及固定 4～15 秒。机器人会提交 `POST /api/v3/contents/generations/ark/tasks`，把任务 ID 持久化到本地数据库，在后台按状态轮询；成功后通过 Telegram 主动发送 MP4。重启后仍会恢复未完成任务的轮询。
 
 视频提示词按 Seedance 2.0 工程化规范生成：单一场景会写清主体、连续动作、场景、光影/风格和一种运镜；多事件或多场景会按“镜头1、镜头2……”给出顺序分镜，避免绝对秒数与同镜头叠加运镜。程序会自动追加高清、稳定、无水印与无 Logo 约束；除非用户明确要求字幕、标题或气泡文字，否则也会要求无文字/无字幕。
 

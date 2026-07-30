@@ -61,7 +61,11 @@ const SEEDANCE_VIDEO_MODEL =
   process.env.SEEDANCE_VIDEO_MODEL || "dreamina-seedance-2-0-mini-260615";
 const SEEDANCE_VIDEO_RESOLUTION = process.env.SEEDANCE_VIDEO_RESOLUTION || "480p";
 const SEEDANCE_VIDEO_RATIO = process.env.SEEDANCE_VIDEO_RATIO || "16:9";
-const SEEDANCE_VIDEO_DURATION = Number(process.env.SEEDANCE_VIDEO_DURATION || 5);
+const SEEDANCE_VIDEO_DURATION = Number(process.env.SEEDANCE_VIDEO_DURATION || -1);
+const VIDEO_DURATION_OPTIONS = Object.freeze([
+  -1,
+  ...Array.from({ length: 12 }, (_, index) => index + 4),
+]);
 const SEEDANCE_VIDEO_GENERATE_AUDIO = !["false", "0", "no"].includes(
   String(process.env.SEEDANCE_VIDEO_GENERATE_AUDIO || "true").trim().toLowerCase(),
 );
@@ -449,8 +453,9 @@ function getToolDefinitions(
           },
           duration: {
             type: "integer",
-            enum: [4, 5],
-            description: "可选时长（秒）。未指定时使用默认时长。",
+            enum: VIDEO_DURATION_OPTIONS,
+            description:
+              "可选时长（秒）：-1 为由模型智能决定时长；固定时长可选 4～15 秒。未指定时使用管理员默认值。",
           },
           generate_audio: {
             type: "boolean",
@@ -1734,10 +1739,12 @@ function normalizeVideoRatio(value) {
 }
 
 function normalizeVideoDuration(value) {
-  if ([4, 5].includes(value)) {
+  if (VIDEO_DURATION_OPTIONS.includes(value)) {
     return value;
   }
-  return [4, 5].includes(SEEDANCE_VIDEO_DURATION) ? SEEDANCE_VIDEO_DURATION : 5;
+  return VIDEO_DURATION_OPTIONS.includes(SEEDANCE_VIDEO_DURATION)
+    ? SEEDANCE_VIDEO_DURATION
+    : -1;
 }
 
 function buildSeedanceVideoPrompt(
