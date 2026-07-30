@@ -8,6 +8,7 @@ const { createLifeAssistant } = require("./life-assistant");
 const { createMcDonaldsMcp } = require("./mcd-mcp");
 const { createAdminFlow } = require("./lib/admin-flow");
 const { createImageHistory } = require("./lib/image-history");
+const { createVideoHistory } = require("./lib/video-history");
 const { createRoleStore } = require("./lib/role-store");
 const {
   buildConversationExport,
@@ -20,6 +21,7 @@ const DATA_FILE = path.join(__dirname, "data");
 const ROLES_SEED_FILE = path.join(__dirname, "roles.json");
 const ROLE_ASSETS_DIR = path.join(__dirname, "role-assets");
 const CONVERSATION_IMAGE_ASSETS_DIR = path.join(__dirname, "conversation-image-assets");
+const CONVERSATION_VIDEO_ASSETS_DIR = path.join(__dirname, "conversation-video-assets");
 const MODEL_SAFETY_TRACE_DIR = path.join(__dirname, "runtime-logs");
 const MODEL_SAFETY_TRACE_FILE = path.join(
   MODEL_SAFETY_TRACE_DIR,
@@ -77,6 +79,10 @@ const IMAGE_PROVIDER = (
 const MAX_IMAGE_REFERENCE_BYTES = 12 * 1024 * 1024;
 const MAX_VIDEO_REFERENCE_DATA_URL_LENGTH = 5 * 1024 * 1024;
 const MAX_VIDEO_REFERENCE_IMAGES = 9;
+const MAX_VIDEO_REFERENCE_VIDEOS = 3;
+const MAX_VIDEO_REFERENCE_BYTES = Math.floor(
+  (MAX_VIDEO_REFERENCE_DATA_URL_LENGTH - 96) * 3 / 4,
+);
 const VIDEO_ROLE_REFERENCE_ID = "role";
 const VIDEO_CURRENT_REFERENCE_ID = "current";
 const VIDEO_TASK_POLL_INTERVAL_MS = 3_000;
@@ -110,8 +116,8 @@ const TOOL_USE_SYSTEM_PROMPT = [
   "图片和视频均采用后台任务。工具结果标记 imageQueued 或 videoQueued 时，只能说明已开始处理、成品会稍后主动发送；绝不能假称图片或视频已经生成、已经发送，或重复 progress_message。",
   "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会直接附带已保存的人设图来锁定角色的面部、发型和参考图原生视觉风格。绝不预设为 2D、动漫或写实：人设图是什么风格，结果就保持什么风格。只有用户明确要求纯风景、纯物品、纯食物或画面中不要人物/角色时，才能设为 false；不要因为提示词没有重复角色名就设为 false。",
   "仅当管理员在私聊中明确要求生成、创建或更新当前角色的“设定图/参考图/角色立绘”时，才把 generate_character_image 的 save_as_role_reference 设为 true；这会把生成图保存为全局角色资产，供后续视频锁定角色身份和画风。普通场景图、壁纸或随手图片绝不能覆盖角色设定图。",
-  "仅当用户明确要求生成、制作或创作视频/动态短片时，才调用 generate_character_video。reference_ids 是按顺序传入的 0～9 张参考图：role 表示当前角色已保存的设定图，current 表示本轮上传图片，img_ 开头的编号来自运行时列出的历史图片。画面包含当前角色时，只要设定图可用就必须在 reference_ids 中加入 role；纯文生视频则传空数组 []。程序会把数组顺序映射为 @图片1、@图片2……，全部作为 reference_image（绝不是首帧）。不可编造不存在的编号、@视频N、@音频N 或 Asset ID。",
-  "调用 generate_character_video 前，先判断用户是否至少给出了主体和核心动作；如果只是一句高度概括的想法且缺少这两项，应先用角色口吻追问，不要擅自编造。信息足够时，将用户意图改写为 Seedance 工程化中文提示词：简单单场景用一段式写清主体、连续细节动作、场景、光影/风格和一种运镜；有多个事件或场景时用“镜头1/镜头2 …”按顺序写分镜，不写绝对秒数，每个镜头只保留一种运镜。若指定参考图，在 prompt 中只能按 reference_ids 的顺序引用对应 @图片N；程序还会加入每张图的参考用途，以及画质、稳定和文字/水印约束。",
+  "仅当用户明确要求生成、制作或创作视频/动态短片时，才调用 generate_character_video。reference_ids 是按顺序传入的 0～9 张参考图：role 表示当前角色已保存的设定图，current 表示本轮上传图片，img_ 开头的编号来自运行时列出的历史图片。画面包含当前角色时，只要设定图可用就必须在 reference_ids 中加入 role；纯文生视频则传空数组 []。程序会把数组顺序映射为 @图片1、@图片2……，全部作为 reference_image（绝不是首帧）。video_reference_ids 是 0～3 段历史视频的编号，只能在用户明确要求“参考某个视频的动作、节奏、运镜或镜头语言”时填写；普通视频生成必须传 []，不能擅自用用户上传视频。它们按顺序映射为 @视频1、@视频2……并作为 reference_video。不可编造不存在的编号、@音频N 或 Asset ID。",
+  "调用 generate_character_video 前，先判断用户是否至少给出了主体和核心动作；如果只是一句高度概括的想法且缺少这两项，应先用角色口吻追问，不要擅自编造。信息足够时，将用户意图改写为 Seedance 工程化中文提示词：简单单场景用一段式写清主体、连续细节动作、场景、光影/风格和一种运镜；有多个事件或场景时用“镜头1/镜头2 …”按顺序写分镜，不写绝对秒数，每个镜头只保留一种运镜。若指定参考图或视频，在 prompt 中只能按 reference_ids 的顺序引用对应 @图片N、按 video_reference_ids 的顺序引用对应 @视频N；程序还会加入每项素材的参考用途，以及画质、稳定和文字/水印约束。",
   "视频提示词里的音频按 Seedance 语法表达：背景音乐用（）包裹，音效用<>包裹，台词用{}包裹；台词尽量使用一种语言。仅在用户明确提出时加入画面文字，并使用对应的字幕、标题或气泡写法。",
   "调用 generate_character_video 时必须提供 1～3 句角色口吻配文。视频采用异步任务生成：工具返回 videoQueued 时只说明已开始制作、成片会稍后发来，绝不能假称视频已生成或已发送。只有用户明确要求画面内字幕、标题、广告语或气泡文字时，才把 allow_on_screen_text 设为 true。",
   "内置工具会始终出现在当前 tools 列表中，便于准确说明机器人支持的能力；但执行前仍必须遵守本轮运行时状态、管理员开关和输入限制。",
@@ -148,6 +154,11 @@ const imageHistory = createImageHistory({
   db,
   assetsDir: CONVERSATION_IMAGE_ASSETS_DIR,
   maxBytes: MAX_IMAGE_REFERENCE_BYTES,
+});
+const videoHistory = createVideoHistory({
+  db,
+  assetsDir: CONVERSATION_VIDEO_ASSETS_DIR,
+  maxBytes: MAX_VIDEO_REFERENCE_BYTES,
 });
 const roleStore = createRoleStore({
   db,
@@ -391,7 +402,12 @@ const adminFlow = createAdminFlow({
 
 function getToolDefinitions(
   ctx,
-  { mcdContext = null, imageEditReference = null, imageEditHistory = [] } = {},
+  {
+    mcdContext = null,
+    imageEditReference = null,
+    imageEditHistory = [],
+    videoReferenceHistory = [],
+  } = {},
 ) {
   const tools = [];
 
@@ -430,7 +446,7 @@ function getToolDefinitions(
     function: {
       name: "generate_character_video",
       description:
-        "生成一段视频短片，可按顺序使用 0～9 张参考图。reference_ids 中 role 是当前角色已保存设定图，current 是本轮上传图片，img_ 开头编号是运行时列出的历史图片；所有图片都作为 reference_image 参考，不限定视频首帧。画面包含当前角色时应选择 role；纯文生视频传空数组。任务完成后会直接发送 MP4 到当前 Telegram 对话。",
+        "生成一段视频短片，可按顺序使用 0～9 张图片和 0～3 段视频参考。reference_ids 中 role 是当前角色已保存设定图，current 是本轮上传图片，img_ 开头编号是历史图片；所有图片都作为 reference_image，不限定视频首帧。video_reference_ids 只可填写运行时列出的 vid_ 历史视频编号，并且仅当用户明确要求参考这些视频的动作、节奏或运镜时使用；它们会作为 reference_video。纯文生视频两个数组都传空。任务完成后会直接发送 MP4 到当前 Telegram 对话。",
       parameters: {
         type: "object",
         properties: {
@@ -445,6 +461,13 @@ function getToolDefinitions(
             items: { type: "string" },
             description:
               "按参考优先级排序的图片列表，可为空数组 []，最多 9 张。role=当前角色已保存设定图；current=本轮上传图片；img_ 开头的值必须来自运行时“历史图片”列表。画面有当前角色时应包含 role；纯文生视频传 []。",
+          },
+          video_reference_ids: {
+            type: "array",
+            maxItems: MAX_VIDEO_REFERENCE_VIDEOS,
+            items: { type: "string" },
+            description:
+              "按参考优先级排序的视频列表，可为空数组 []，最多 3 段。只能填写运行时“历史视频”列出的 vid_ 编号；仅当用户明确要求参考这些视频的动作节奏、运镜或镜头语言时才填写，否则必须传 []。",
           },
           ratio: {
             type: "string",
@@ -471,7 +494,7 @@ function getToolDefinitions(
               "随最终视频发送的中文文案。必须用当前角色口吻写 1～3 句，俏皮自然并结合最近对话或用户提出的画面；不要写冷冰冰的操作提示。",
           },
         },
-        required: ["prompt", "caption", "reference_ids"],
+        required: ["prompt", "caption", "reference_ids", "video_reference_ids"],
         additionalProperties: false,
       },
     },
@@ -605,7 +628,7 @@ function getToolDefinitions(
 
 function buildToolRuntimeContext(
   settings,
-  { imageEditReference = null, imageEditHistory = [] } = {},
+  { imageEditReference = null, imageEditHistory = [], videoReferenceHistory = [] } = {},
 ) {
   const state = (enabled) => (enabled ? "开启，可执行" : "关闭，不可执行");
   const referenceState = imageEditReference?.image
@@ -627,6 +650,19 @@ function buildToolRuntimeContext(
     `历史图片可选：${historyState}。`,
     "纯文生视频必须传 []；只有使用实际存在的图片时才写对应的 @图片N。",
   ].join("");
+  const videoHistoryState = videoReferenceHistory.length > 0
+    ? videoReferenceHistory
+      .map((reference) => {
+        const detail = reference.caption ? `，说明：${reference.caption.slice(0, 80)}` : "";
+        return `${reference.referenceId}（${reference.sourceLabel || "视频"}${detail}）`;
+      })
+      .join("；")
+    : "没有可用的历史视频";
+  const videoMotionReferenceState = [
+    "视频参考：video_reference_ids 可以传 0～3 项，顺序就是 @视频1、@视频2……的顺序。",
+    `历史视频可选：${videoHistoryState}。`,
+    "只有用户明确要求借鉴这些视频的动作、节奏、运镜或镜头语言时才可填写；否则必须传 []。",
+  ].join("");
 
   return {
     role: "system",
@@ -635,7 +671,7 @@ function buildToolRuntimeContext(
       `当前时间：${state(settings.timeEnabled)}。`,
       `角色图片：${state(settings.imageEnabled)}。`,
       `图片编辑（I2I）：${state(settings.imageEditEnabled)}；${referenceState}。历史图片：${historyState}。`,
-      `角色视频：${state(settings.videoEnabled)}；默认 ${SEEDANCE_VIDEO_RESOLUTION}。${videoReferenceState}`,
+      `角色视频：${state(settings.videoEnabled)}；默认 ${SEEDANCE_VIDEO_RESOLUTION}。${videoReferenceState}${videoMotionReferenceState}`,
       `联网搜索：${state(settings.webSearchEnabled)}。`,
       `生活助手：${state(settings.lifeAssistantEnabled)}。`,
     ].join("\n"),
@@ -1484,6 +1520,10 @@ async function getImageEditHistory(scope, roleName, { excludeReferenceId = "" } 
   return history.filter((reference) => reference.referenceId !== excludeReferenceId);
 }
 
+async function getVideoReferenceHistory(scope, roleName) {
+  return videoHistory.list({ scope, roleName });
+}
+
 function isLikelyImageEditIntent(text, { hasCurrentReference = false, hasHistory = false } = {}) {
   const normalized = typeof text === "string"
     ? text.replace(/\s+/g, "").toLowerCase()
@@ -1544,7 +1584,7 @@ async function resolveImageEditReference({
   return imageHistory.load({ scope, roleName, referenceId: requestedId });
 }
 
-function normalizeVideoReferenceIds(value) {
+function normalizeVideoImageReferenceIds(value) {
   if (!Array.isArray(value)) {
     return { ok: false, error: "视频参考图必须是数组；不使用图片时请传空数组 []。" };
   }
@@ -1571,18 +1611,49 @@ function normalizeVideoReferenceIds(value) {
   return { ok: true, referenceIds };
 }
 
+function normalizeVideoReferenceVideoIds(value) {
+  if (!Array.isArray(value)) {
+    return { ok: false, error: "视频参考素材必须是数组；不使用参考视频时请传空数组 []。" };
+  }
+  if (value.length > MAX_VIDEO_REFERENCE_VIDEOS) {
+    return {
+      ok: false,
+      error: `视频最多可以使用 ${MAX_VIDEO_REFERENCE_VIDEOS} 段参考视频。`,
+    };
+  }
+
+  const referenceIds = [];
+  const seen = new Set();
+  for (const valueItem of value) {
+    const referenceId = typeof valueItem === "string" ? valueItem.trim() : "";
+    if (!referenceId) {
+      return { ok: false, error: "视频参考素材中包含无效的视频编号。" };
+    }
+    if (seen.has(referenceId)) {
+      return { ok: false, error: "同一段参考视频不能在一个视频任务中重复使用。" };
+    }
+    seen.add(referenceId);
+    referenceIds.push(referenceId);
+  }
+  return { ok: true, referenceIds };
+}
+
 async function resolveVideoReferenceSelection({
   scope,
   session,
   currentReference = null,
   history = [],
+  videoReferenceHistory = [],
   referenceIds,
+  videoReferenceIds,
 }) {
-  const normalized = normalizeVideoReferenceIds(referenceIds);
-  if (!normalized.ok) return normalized;
+  const normalizedImages = normalizeVideoImageReferenceIds(referenceIds);
+  if (!normalizedImages.ok) return normalizedImages;
+  const normalizedVideos = normalizeVideoReferenceVideoIds(videoReferenceIds);
+  if (!normalizedVideos.ok) return normalizedVideos;
 
   const references = [];
-  for (const referenceId of normalized.referenceIds) {
+  for (const referenceId of normalizedImages.referenceIds) {
     if (referenceId === VIDEO_ROLE_REFERENCE_ID) {
       const role = await getTaskRole(session.roleName);
       const roleReference = role ? await loadRoleReferenceImageForRole(role) : null;
@@ -1635,9 +1706,27 @@ async function resolveVideoReferenceSelection({
     references.push({ source: "history", referenceId });
   }
 
+  const videoReferences = [];
+  for (const referenceId of normalizedVideos.referenceIds) {
+    if (!videoReferenceHistory.some((reference) => reference.referenceId === referenceId)) {
+      return {
+        ok: false,
+        error: "视频参考素材不在当前可用视频列表中。请使用运行时列出的编号，或重新上传视频。",
+      };
+    }
+    const loaded = await videoHistory.load({
+      scope,
+      roleName: session.roleName,
+      referenceId,
+    });
+    if (!loaded.ok) return loaded;
+    videoReferences.push({ source: "history", referenceId });
+  }
+
   return {
     ok: true,
     references,
+    videoReferences,
     roleReferenceUsed: references.some((reference) => reference.source === "role"),
   };
 }
@@ -1651,6 +1740,12 @@ async function loadVideoTaskReferences(taskRecord) {
     : legacyReferences;
   if (descriptors.length > MAX_VIDEO_REFERENCE_IMAGES) {
     return { ok: false, error: `视频任务的参考图超过 ${MAX_VIDEO_REFERENCE_IMAGES} 张上限。` };
+  }
+  const videoDescriptors = Array.isArray(taskRecord.referenceVideos)
+    ? taskRecord.referenceVideos
+    : [];
+  if (videoDescriptors.length > MAX_VIDEO_REFERENCE_VIDEOS) {
+    return { ok: false, error: `视频任务的参考视频超过 ${MAX_VIDEO_REFERENCE_VIDEOS} 段上限。` };
   }
 
   const references = [];
@@ -1683,9 +1778,24 @@ async function loadVideoTaskReferences(taskRecord) {
     return { ok: false, error: "视频任务含有无效的参考图配置。" };
   }
 
+  const videoReferences = [];
+  for (const descriptor of videoDescriptors) {
+    if (descriptor?.source !== "history" || typeof descriptor.referenceId !== "string") {
+      return { ok: false, error: "视频任务含有无效的参考视频配置。" };
+    }
+    const historyReference = await videoHistory.load({
+      scope: { chatId: taskRecord.chatId, userId: taskRecord.userId },
+      roleName: taskRecord.roleName,
+      referenceId: descriptor.referenceId,
+    });
+    if (!historyReference.ok) return historyReference;
+    videoReferences.push({ ...historyReference, source: "history" });
+  }
+
   return {
     ok: true,
     references,
+    videoReferences,
     roleReferenceUsed: references.some((reference) => reference.source === "role"),
   };
 }
@@ -1722,11 +1832,28 @@ async function saveGeneratedImageToHistory({ scope, roleName, image, sourceLabel
   }
 }
 
-function toVideoReferenceDataUrl(referenceImage) {
+function toVideoImageReferenceDataUrl(referenceImage) {
   if (!referenceImage?.ok || !Buffer.isBuffer(referenceImage.image)) {
     return null;
   }
   const dataUrl = `data:${normalizeRoleReferenceMimeType(referenceImage.mimeType)};base64,${referenceImage.image.toString("base64")}`;
+  return dataUrl.length <= MAX_VIDEO_REFERENCE_DATA_URL_LENGTH ? dataUrl : null;
+}
+
+function normalizeVideoReferenceMimeType(value) {
+  const mimeType = typeof value === "string"
+    ? value.split(";", 1)[0].trim().toLowerCase()
+    : "";
+  return ["video/mp4", "video/webm", "video/quicktime"].includes(mimeType)
+    ? mimeType
+    : "video/mp4";
+}
+
+function toVideoReferenceVideoDataUrl(referenceVideo) {
+  if (!referenceVideo?.ok || !Buffer.isBuffer(referenceVideo.video)) {
+    return null;
+  }
+  const dataUrl = `data:${normalizeVideoReferenceMimeType(referenceVideo.mimeType)};base64,${referenceVideo.video.toString("base64")}`;
   return dataUrl.length <= MAX_VIDEO_REFERENCE_DATA_URL_LENGTH ? dataUrl : null;
 }
 
@@ -1749,7 +1876,7 @@ function normalizeVideoDuration(value) {
 
 function buildSeedanceVideoPrompt(
   rawPrompt,
-  { allowOnScreenText = false, referenceImages = [] } = {},
+  { allowOnScreenText = false, referenceImages = [], referenceVideos = [] } = {},
 ) {
   const prompt = typeof rawPrompt === "string"
     ? rawPrompt.replace(/\s+/g, " ").trim()
@@ -1781,7 +1908,13 @@ function buildSeedanceVideoPrompt(
   const referenceInstruction = referenceInstructions.length > 0
     ? `参考素材绑定（按上传顺序）：\n${referenceInstructions.join("\n")}\n\n`
     : "";
-  return `${referenceInstruction}${prompt}\n\n全局画质与稳定约束：${constraints.join("")}`;
+  const videoReferenceInstructions = referenceVideos.map((referenceVideo, index) => (
+    `@视频${index + 1} 是用户明确指定的视频参考素材，只借鉴用户要求的动作节奏、运镜、镜头语言或运动趋势；不要照搬其内容、人物或音频，也不要把它当成要继续剪辑的原视频。`
+  ));
+  const videoReferenceInstruction = videoReferenceInstructions.length > 0
+    ? `视频参考素材绑定（按上传顺序）：\n${videoReferenceInstructions.join("\n")}\n\n`
+    : "";
+  return `${referenceInstruction}${videoReferenceInstruction}${prompt}\n\n全局画质与稳定约束：${constraints.join("")}`;
 }
 
 function waitForVideoPoll() {
@@ -1802,6 +1935,7 @@ async function submitSeedanceVideoTask({
   generateAudio,
   allowOnScreenText,
   referenceImages = [],
+  referenceVideos = [],
 }) {
   if (!isVideoGenerationConfigured()) {
     return {
@@ -1811,10 +1945,10 @@ async function submitSeedanceVideoTask({
   }
 
   const rawPrompt = typeof prompt === "string" ? prompt.replace(/\s+/g, " ").trim() : "";
-  if (/@(?:视频|音频)\d+|asset[-_:/]/i.test(rawPrompt)) {
+  if (/@音频\d+|asset[-_:/]/i.test(rawPrompt)) {
     return {
       ok: false,
-      error: "视频提示词不能使用 @视频/@音频 或 Asset ID。",
+      error: "视频提示词不能使用 @音频 或 Asset ID。",
     };
   }
   if (!Array.isArray(referenceImages) || referenceImages.length > MAX_VIDEO_REFERENCE_IMAGES) {
@@ -1823,7 +1957,13 @@ async function submitSeedanceVideoTask({
       error: `视频参考图必须为 0～${MAX_VIDEO_REFERENCE_IMAGES} 张。`,
     };
   }
-  const referenceDataUrls = referenceImages.map(toVideoReferenceDataUrl);
+  if (!Array.isArray(referenceVideos) || referenceVideos.length > MAX_VIDEO_REFERENCE_VIDEOS) {
+    return {
+      ok: false,
+      error: `视频参考素材必须为 0～${MAX_VIDEO_REFERENCE_VIDEOS} 段。`,
+    };
+  }
+  const referenceDataUrls = referenceImages.map(toVideoImageReferenceDataUrl);
   const invalidReferenceIndex = referenceDataUrls.findIndex((referenceDataUrl) => !referenceDataUrl);
   if (invalidReferenceIndex >= 0) {
     return {
@@ -1838,9 +1978,27 @@ async function submitSeedanceVideoTask({
       error: "视频提示词引用了未提供的参考图。请检查 @图片编号与 reference_ids 的顺序。",
     };
   }
+  const referenceVideoDataUrls = referenceVideos.map(toVideoReferenceVideoDataUrl);
+  const invalidVideoReferenceIndex = referenceVideoDataUrls.findIndex(
+    (referenceDataUrl) => !referenceDataUrl,
+  );
+  if (invalidVideoReferenceIndex >= 0) {
+    return {
+      ok: false,
+      error: `第 ${invalidVideoReferenceIndex + 1} 段视频参考过大或无效。请发送更短、更小的 MP4、WebM 或 MOV 视频。`,
+    };
+  }
+  const referencedVideoNumbers = [...rawPrompt.matchAll(/@视频(\d+)/g)].map((match) => Number(match[1]));
+  if (referencedVideoNumbers.some((videoNumber) => videoNumber < 1 || videoNumber > referenceVideos.length)) {
+    return {
+      ok: false,
+      error: "视频提示词引用了未提供的视频参考。请检查 @视频编号与 video_reference_ids 的顺序。",
+    };
+  }
   const optimizedPrompt = buildSeedanceVideoPrompt(prompt, {
     allowOnScreenText,
     referenceImages,
+    referenceVideos,
   });
   if (!optimizedPrompt || optimizedPrompt.length > 4_000) {
     return { ok: false, error: "视频提示词不能为空且不能超过 4000 个字符。" };
@@ -1857,6 +2015,11 @@ async function submitSeedanceVideoTask({
         type: "image_url",
         role: "reference_image",
         image_url: { url: referenceDataUrl },
+      })),
+      ...referenceVideoDataUrls.map((referenceDataUrl) => ({
+        type: "video_url",
+        role: "reference_video",
+        video_url: { url: referenceDataUrl },
       })),
     ],
     ratio: normalizeVideoRatio(ratio),
@@ -1906,6 +2069,7 @@ async function submitSeedanceVideoTask({
       duration: requestBody.duration,
       roleReferenceUsed: referenceImages.some((referenceImage) => referenceImage.source === "role"),
       referenceImageCount: referenceImages.length,
+      referenceVideoCount: referenceVideos.length,
     };
   } catch (error) {
     console.error("创建角色视频任务失败:", error);
@@ -2001,6 +2165,9 @@ async function processVideoTaskDelivery(taskRecordId) {
       referenceImageCount: Array.isArray(taskRecord.referenceImages)
         ? taskRecord.referenceImages.length
         : (taskRecord.roleReferenceUsed === true ? 1 : 0),
+      referenceVideoCount: Array.isArray(taskRecord.referenceVideos)
+        ? taskRecord.referenceVideos.length
+        : 0,
     });
     const taskReferences = await loadVideoTaskReferences(taskRecord);
     if (!taskReferences.ok) {
@@ -2028,6 +2195,7 @@ async function processVideoTaskDelivery(taskRecordId) {
       generateAudio: taskRecord.generateAudio,
       allowOnScreenText: taskRecord.allowOnScreenText === true,
       referenceImages: taskReferences.references,
+      referenceVideos: taskReferences.videoReferences,
     });
     if (!submitted.ok) {
       await db.updateAsync(
@@ -2064,6 +2232,7 @@ async function processVideoTaskDelivery(taskRecordId) {
           duration: submitted.duration,
           roleReferenceUsed: submitted.roleReferenceUsed === true,
           referenceImageCount: submitted.referenceImageCount,
+          referenceVideoCount: submitted.referenceVideoCount,
           submittedAt,
         },
       },
@@ -2077,6 +2246,7 @@ async function processVideoTaskDelivery(taskRecordId) {
       duration: submitted.duration,
       roleReferenceUsed: submitted.roleReferenceUsed === true,
       referenceImageCount: submitted.referenceImageCount,
+      referenceVideoCount: submitted.referenceVideoCount,
     };
     await writeGenerationTaskLog("video-task-submitted", {
       taskId: taskRecord._id,
@@ -2089,6 +2259,7 @@ async function processVideoTaskDelivery(taskRecordId) {
       duration: submitted.duration,
       resolution: submitted.resolution,
       referenceImageCount: submitted.referenceImageCount,
+      referenceVideoCount: submitted.referenceVideoCount,
     });
   }
 
@@ -2502,6 +2673,7 @@ async function executeToolCall(
   {
     imageEditReference = null,
     imageEditHistory = [],
+    videoReferenceHistory = [],
     imageEditState = null,
     mcdContext = null,
     imageGenerationState = null,
@@ -2611,7 +2783,9 @@ async function executeToolCall(
       session,
       currentReference: imageEditReference,
       history: imageEditHistory,
+      videoReferenceHistory,
       referenceIds: args.reference_ids,
+      videoReferenceIds: args.video_reference_ids,
     });
     if (!selectedReferences.ok) {
       return selectedReferences;
@@ -2634,6 +2808,8 @@ async function executeToolCall(
       roleName: session.roleName,
       referenceImages: selectedReferences.references,
       referenceImageCount: selectedReferences.references.length,
+      referenceVideos: selectedReferences.videoReferences,
+      referenceVideoCount: selectedReferences.videoReferences.length,
       roleReferenceUsed: selectedReferences.roleReferenceUsed,
       createdAt: now,
     });
@@ -2650,6 +2826,7 @@ async function executeToolCall(
       generateAudio: args.generate_audio,
       allowOnScreenText: args.allow_on_screen_text === true,
       referenceImageCount: selectedReferences.references.length,
+      referenceVideoCount: selectedReferences.videoReferences.length,
       roleReferenceUsed: selectedReferences.roleReferenceUsed,
     });
     scheduleVideoTaskDelivery(taskRecord._id);
@@ -2663,6 +2840,7 @@ async function executeToolCall(
       duration: taskRecord.duration,
       roleName: session.roleName,
       referenceImageCount: selectedReferences.references.length,
+      referenceVideoCount: selectedReferences.videoReferences.length,
       roleReferenceUsed: selectedReferences.roleReferenceUsed,
     };
   }
@@ -2928,6 +3106,7 @@ async function runModelWithTools(
     model = TEXT_MODEL,
     imageEditReference = null,
     imageEditHistory = [],
+    videoReferenceHistory = [],
     forceImageEdit = false,
     mcdContext = null,
   } = {},
@@ -2955,12 +3134,17 @@ async function runModelWithTools(
         mcdContext: activeMcdContext,
         imageEditReference,
         imageEditHistory,
+        videoReferenceHistory,
       });
       const request = {
         model,
         messages: buildModelMessages(
           conversation,
-          buildToolRuntimeContext(settings, { imageEditReference, imageEditHistory }),
+          buildToolRuntimeContext(settings, {
+            imageEditReference,
+            imageEditHistory,
+            videoReferenceHistory,
+          }),
         ),
       };
 
@@ -3034,6 +3218,7 @@ async function runModelWithTools(
         const result = await executeToolCall(ctx, toolCall, {
           imageEditReference,
           imageEditHistory,
+          videoReferenceHistory,
           imageEditState,
           mcdContext: activeMcdContext,
           imageGenerationState,
@@ -3184,8 +3369,15 @@ async function processConversationTask(scope) {
     } catch (error) {
       console.warn("读取历史图片失败:", error.message);
     }
+    let videoReferenceHistory = [];
+    try {
+      videoReferenceHistory = await getVideoReferenceHistory(scope, session.roleName);
+    } catch (error) {
+      console.warn("读取历史视频失败:", error.message);
+    }
     const result = await runModelWithTools(ctx, messages, {
       imageEditHistory,
+      videoReferenceHistory,
       forceImageEdit: isLikelyImageEditIntent(batchText, {
         hasHistory: imageEditHistory.length > 0,
       }),
@@ -3290,6 +3482,51 @@ async function downloadTelegramPhotoReference(ctx) {
     fileSize: photo?.file_size,
     fallbackMimeType: "image/jpeg",
   });
+}
+
+async function downloadTelegramVideoReference(ctx) {
+  const video = ctx.message?.video;
+  if (!video?.file_id) {
+    return { ok: false, error: "没有读取到视频附件。" };
+  }
+  if (Number(video.file_size || 0) > MAX_VIDEO_REFERENCE_BYTES) {
+    return {
+      ok: false,
+      error: `视频参考暂时不能超过 ${Math.floor(MAX_VIDEO_REFERENCE_BYTES / 1024 / 1024)}MB；请发送更短或更小的视频。`,
+    };
+  }
+
+  try {
+    const fileLink = await ctx.telegram.getFileLink(video.file_id);
+    const response = await fetch(String(fileLink), {
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!response.ok) {
+      throw new Error(`Telegram 视频下载失败（HTTP ${response.status}）`);
+    }
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > MAX_VIDEO_REFERENCE_BYTES) {
+      return {
+        ok: false,
+        error: `视频参考暂时不能超过 ${Math.floor(MAX_VIDEO_REFERENCE_BYTES / 1024 / 1024)}MB；请发送更短或更小的视频。`,
+      };
+    }
+    const downloadedVideo = Buffer.from(await response.arrayBuffer());
+    if (downloadedVideo.length === 0 || downloadedVideo.length > MAX_VIDEO_REFERENCE_BYTES) {
+      return { ok: false, error: "视频为空或超过参考素材大小限制。" };
+    }
+    const headerMimeType = (response.headers.get("content-type") || "")
+      .split(";", 1)[0]
+      .trim()
+      .toLowerCase();
+    const mimeType = ["video/mp4", "video/webm", "video/quicktime"].includes(headerMimeType)
+      ? headerMimeType
+      : normalizeVideoReferenceMimeType(video.mime_type);
+    return { ok: true, video: downloadedVideo, mimeType };
+  } catch (error) {
+    console.error("下载 Telegram 视频失败:", error);
+    return { ok: false, error: "下载这段视频失败，请重新上传后再试。" };
+  }
 }
 
 async function handleAdminRoleReferencePhoto(ctx, scope) {
@@ -3418,6 +3655,101 @@ function buildStoredVisualMessage(sourceLabel, caption, semanticHint = "") {
   return { role: "user", content: `[用户发送了一张${sourceLabel}${detail}${emojiDetail}]` };
 }
 
+function buildStoredVideoReferenceMessage(referenceId, caption) {
+  const detail = caption ? `，附言：“${caption}”` : "";
+  return {
+    role: "user",
+    content:
+      `[用户发送了一段视频，已保存为视频参考素材 ${referenceId}${detail}]` +
+      "该视频仅在用户明确要求参考其动作、节奏或运镜时可用于视频生成。",
+  };
+}
+
+async function handleVideoReferenceUpload(ctx, scope) {
+  const session = await findActiveSession(scope);
+  if (!session || !Array.isArray(session.messages) || session.messages.length === 0) {
+    await ctx.reply("请先用 /newchat <角色名字> 开启对话，再发送视频参考素材。");
+    return;
+  }
+
+  const uploaded = await downloadTelegramVideoReference(ctx);
+  if (!uploaded.ok) {
+    await ctx.reply(uploaded.error);
+    return;
+  }
+
+  const caption = typeof ctx.message?.caption === "string" ? ctx.message.caption.trim() : "";
+  let savedReference;
+  try {
+    savedReference = await videoHistory.save({
+      scope,
+      roleName: session.roleName,
+      sourceLabel: "Telegram 视频",
+      caption,
+      video: uploaded.video,
+      mimeType: uploaded.mimeType,
+    });
+  } catch (error) {
+    console.error("保存视频参考失败:", error);
+    await ctx.reply("这段视频没能保存为参考素材，请稍后重新发送。");
+    return;
+  }
+  if (!savedReference.ok) {
+    await ctx.reply(savedReference.error);
+    return;
+  }
+
+  const savedMessages = [...session.messages];
+  const incomingMessage = buildStoredVideoReferenceMessage(savedReference.referenceId, caption);
+  if (!caption) {
+    await db.updateAsync(
+      { _id: session._id, type: "chat-session" },
+      {
+        $set: {
+          messages: [...savedMessages, incomingMessage],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    );
+    await ctx.reply("这段视频我先收进素材夹啦。之后明确说“参考刚才的视频动作/运镜生成……”就会把它带进片场。🎞️");
+    return;
+  }
+
+  let imageEditHistory = [];
+  let videoReferenceHistory = [];
+  try {
+    [imageEditHistory, videoReferenceHistory] = await Promise.all([
+      getImageEditHistory(scope, session.roleName),
+      getVideoReferenceHistory(scope, session.roleName),
+    ]);
+  } catch (error) {
+    console.warn("读取视频生成素材历史失败:", error.message);
+  }
+
+  await ctx.sendChatAction("typing").catch(() => undefined);
+  try {
+    const modelMessages = [...savedMessages, incomingMessage];
+    const result = await runModelWithTools(ctx, modelMessages, {
+      imageEditHistory,
+      videoReferenceHistory,
+    });
+    const generatedMessages = result.messages.slice(modelMessages.length);
+    await db.updateAsync(
+      { _id: session._id, type: "chat-session" },
+      {
+        $set: {
+          messages: [...savedMessages, incomingMessage, ...generatedMessages],
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    );
+    await replyWithText(ctx, result.answer);
+  } catch (error) {
+    console.error("处理视频参考指令失败:", error);
+    await ctx.reply("视频已经收好，但这次没能处理附言。稍后直接用文字说明如何参考它就好。 ");
+  }
+}
+
 async function handleVisualConversation(ctx, scope, { sourceLabel, caption, download, semanticHint = "" }) {
   const settings = await getToolSettings();
   const forceImageEdit = isLikelyImageEditIntent(caption, { hasCurrentReference: true });
@@ -3471,6 +3803,12 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
   } catch (error) {
     console.warn("读取历史图片失败:", error.message);
   }
+  let videoReferenceHistory = [];
+  try {
+    videoReferenceHistory = await getVideoReferenceHistory(scope, session.roleName);
+  } catch (error) {
+    console.warn("读取历史视频失败:", error.message);
+  }
 
   const incomingMessage = forceImageEdit
     ? buildDirectImageEditUserMessage({ sourceLabel, caption })
@@ -3499,6 +3837,7 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
       ...(forceImageEdit ? {} : getVisionModelRoute()),
       imageEditReference,
       imageEditHistory,
+      videoReferenceHistory,
       forceImageEdit,
     });
     const generatedMessages = result.messages.slice(modelMessages.length);
@@ -4090,7 +4429,7 @@ bot.help((ctx) => {
     : "";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
+    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；明确说“参考刚才视频的动作/运镜生成……”时才会使用，最多 3 段。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。" +
       adminHelp,
   );
 });
@@ -4200,6 +4539,25 @@ bot.on(message("sticker"), async (ctx) => {
       semanticHint: getStickerEmojiHint(backgroundCtx.message?.sticker),
     });
   }).catch((error) => console.error("处理 sticker 后台任务失败:", error));
+});
+
+bot.on(message("video"), async (ctx) => {
+  if (!isPrivateChat(ctx)) {
+    return;
+  }
+
+  const scope = getScope(ctx);
+  if (!scope) {
+    return;
+  }
+
+  const backgroundCtx = createBackgroundContext({
+    chatId: scope.chatId,
+    userId: scope.userId,
+    message: ctx.message,
+  });
+  void runInSessionQueue(scope, () => handleVideoReferenceUpload(backgroundCtx, scope))
+    .catch((error) => console.error("处理视频参考素材失败:", error));
 });
 
 async function handleLocationUpdate(ctx) {
