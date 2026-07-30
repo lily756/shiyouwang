@@ -14,7 +14,7 @@ const {
   createConversationExportFilename,
 } = require("./conversation-export");
 
-require("dotenv").config({ path: path.join(__dirname, ".env") });
+// require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const DATA_FILE = path.join(__dirname, "data");
 const ROLES_SEED_FILE = path.join(__dirname, "roles.json");
@@ -70,6 +70,7 @@ const MAX_IMAGE_REFERENCE_BYTES = 12 * 1024 * 1024;
 const MAX_VIDEO_REFERENCE_DATA_URL_LENGTH = 5 * 1024 * 1024;
 const VIDEO_TASK_POLL_INTERVAL_MS = 3_000;
 const VIDEO_TASK_TIMEOUT_MS = 10 * 60 * 1_000;
+const CONVERSATION_DEBOUNCE_MS = 1_500;
 const TEXT_MODEL = process.env.OPENAI_MODEL || "";
 const VISION_MODEL = process.env.OPENAI_VISION_MODEL || TEXT_MODEL;
 const OPENAI_THINKING_ENABLED = !["false", "0", "no", "off"].includes(
@@ -94,7 +95,8 @@ const TOOL_USE_SYSTEM_PROMPT = [
   "你正在进行角色对话，并且可能有工具可用。",
   "当用户需要准确的当前时间时，必须调用 get_current_time，不能凭记忆猜测。",
   "除非用户明确表示不要图片，当当前角色刚换装、来到漂亮或有故事感的场景、发生自然的自拍/打卡/纪念瞬间，或对话中出现其他确实值得用一张照片记录的具体画面时，主动调用 generate_character_image，把照片直接发给用户。每条用户消息至多主动生成一张；不要因为抽象感慨、普通寒暄、知识问答或只有一个形容词就滥用图片。",
-  "调用 generate_character_image 时，必须同时提供 caption：用当前角色口吻写 1～3 句俏皮、自然的配文，结合最近对话或用户刚提出的画面。不要写“正在生成图片”“角色图片已生成”等操作提示，也不要复述 system prompt。图片发送成功后，继续用角色口吻接住用户的话题。",
+  "调用 generate_character_image 或 edit_reference_image 时，必须同时提供 progress_message 和 caption。progress_message 是图片任务开始前立刻发出的 1～2 句角色台词，必须结合本轮上下文、自然俏皮，不能写固定的‘正在生成/正在编辑’操作提示；caption 是随成图发送的 1～3 句配文，两者不要机械重复。图片发送成功后，继续用角色口吻接住用户的话题。",
+  "图片和视频均采用后台任务。工具结果标记 imageQueued 或 videoQueued 时，只能说明已开始处理、成品会稍后主动发送；绝不能假称图片或视频已经生成、已经发送，或重复 progress_message。",
   "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会优先使用已保存的人设图保持角色的面部、发型和 2D 画风。若画面只是纯风景、物品、食物或与角色本人无关的内容，设为 false，不能强行让角色入镜。",
   "仅当管理员在私聊中明确要求生成、创建或更新当前角色的“设定图/参考图/角色立绘”时，才把 generate_character_image 的 save_as_role_reference 设为 true；这会把生成图保存为全局角色资产，供后续视频锁定角色身份和画风。普通场景图、壁纸或随手图片绝不能覆盖角色设定图。",
   "仅当用户明确要求生成、制作或创作当前角色的视频/动态短片时，才调用 generate_character_video。该工具会自动把当前角色已保存的设定图作为唯一的 @图片1 参考素材（reference_image），用于锁定角色身份与画风，而不是限定视频首帧；不要在 prompt 中自行编造其他 @图片N、@视频N、@音频N 或 Asset ID。若工具提示当前角色没有设定图，应请管理员先生成或上传并保存设定图。",
@@ -161,6 +163,9 @@ const {
   runInSessionQueue,
 } = roleStore;
 const activeVideoTaskRuns = new Set();
+const activeImageTaskRuns = new Set();
+const activeConversationTaskRuns = new Set();
+const conversationDebounceTimers = new Map();
 
 function isAdmin(ctx) {
   return ADMIN_USER_IDS.has(String(ctx.from?.id));
@@ -453,6 +458,11 @@ function getToolDefinitions(
             description:
               "发送图片时附带的中文文案。必须用当前角色口吻写 1～3 句，俏皮自然，并结合最近对话或用户刚提出的画面；不要使用“正在生成图片”“角色图片已生成”之类冷冰冰的操作提示。",
           },
+          progress_message: {
+            type: "string",
+            description:
+              "图片开始生成前立即发送给用户的中文台词。必须用当前角色口吻写 1～2 句，结合这次画面和最近对话，自然俏皮；不能使用固定套话或“正在生成图片”等冷冰冰操作提示，且不要与最终 caption 机械重复。",
+          },
           include_current_role: {
             type: "boolean",
             description:
@@ -464,7 +474,7 @@ function getToolDefinitions(
               "仅限管理员明确要求生成、更新当前角色的设定图/参考图/立绘时设为 true。普通图片生成必须省略或设为 false。",
           },
         },
-        required: ["prompt", "caption", "include_current_role"],
+        required: ["prompt", "caption", "progress_message", "include_current_role"],
         additionalProperties: false,
       },
     },
@@ -505,8 +515,20 @@ function getToolDefinitions(
             description:
               "随编辑结果发送的中文配文。必须用当前角色口吻写 1～3 句，俏皮自然，结合用户这次的编辑意图；不要使用冷冰冰的操作提示。",
           },
+          progress_message: {
+            type: "string",
+            description:
+              "图片开始编辑前立即发送给用户的中文台词。必须用当前角色口吻写 1～2 句，结合用户这次改图意图，自然俏皮；不能使用固定套话或“正在编辑图片”等冷冰冰操作提示，且不要与最终 caption 机械重复。",
+          },
         },
-        required: ["reference_id", "edit_type", "instruction", "include_current_role", "caption"],
+        required: [
+          "reference_id",
+          "edit_type",
+          "instruction",
+          "include_current_role",
+          "caption",
+          "progress_message",
+        ],
         additionalProperties: false,
       },
     },
@@ -1346,14 +1368,21 @@ async function loadCurrentRoleReferenceImage(ctx) {
   if (!activeRole.ok) {
     return activeRole;
   }
+  return loadRoleReferenceImageForRole(activeRole.role);
+}
+
+async function loadRoleReferenceImageForRole(role) {
+  if (!role?.id || !role?.name) {
+    return { ok: false, error: "当前角色不存在或角色数据不完整。" };
+  }
   const stored = await db.findOneAsync({
     type: "role-reference-image",
-    roleId: activeRole.role.id,
+    roleId: role.id,
   });
   if (!stored?.localPath || !isPathInRoleAssets(stored.localPath)) {
     return {
       ok: false,
-      error: `角色「${activeRole.role.name}」尚未保存设定图。请管理员先生成或上传一张角色设定图并明确要求保存。`,
+      error: `角色「${role.name}」尚未保存设定图。请管理员先生成或上传一张角色设定图并明确要求保存。`,
     };
   }
 
@@ -1364,7 +1393,7 @@ async function loadCurrentRoleReferenceImage(ctx) {
     }
     return {
       ok: true,
-      roleName: activeRole.role.name,
+      roleName: role.name,
       image,
       mimeType: normalizeRoleReferenceMimeType(stored.mimeType),
     };
@@ -1372,7 +1401,7 @@ async function loadCurrentRoleReferenceImage(ctx) {
     console.warn("读取角色设定图失败:", error.message);
     return {
       ok: false,
-      error: `角色「${activeRole.role.name}」的设定图不可读取。请管理员重新保存一张设定图。`,
+      error: `角色「${role.name}」的设定图不可读取。请管理员重新保存一张设定图。`,
     };
   }
 }
@@ -1448,11 +1477,21 @@ async function saveImageToCurrentHistory(ctx, { image, sourceLabel, caption }) {
     return activeRole;
   }
 
+  return saveGeneratedImageToHistory({
+    scope: activeRole.scope,
+    roleName: activeRole.session.roleName,
+    image,
+    sourceLabel,
+    caption,
+  });
+}
+
+async function saveGeneratedImageToHistory({ scope, roleName, image, sourceLabel, caption }) {
   try {
     const localImage = await readGeneratedCharacterImage(image);
     return imageHistory.save({
-      scope: activeRole.scope,
-      roleName: activeRole.session.roleName,
+      scope,
+      roleName,
       sourceLabel,
       caption,
       image: localImage.image,
@@ -1698,12 +1737,74 @@ function scheduleVideoTaskDelivery(taskRecordId) {
 }
 
 async function processVideoTaskDelivery(taskRecordId) {
-  const taskRecord = await db.findOneAsync({
+  let taskRecord = await db.findOneAsync({
     _id: taskRecordId,
     type: "video-generation-task",
   });
-  if (!taskRecord || !["queued", "processing"].includes(taskRecord.status)) {
+  if (!taskRecord || !["submitting", "queued", "processing"].includes(taskRecord.status)) {
     return;
+  }
+
+  if (taskRecord.status === "submitting") {
+    const role = await getTaskRole(taskRecord.roleName);
+    const roleReference = role ? await loadRoleReferenceImageForRole(role) : null;
+    if (!roleReference?.ok) {
+      const error = roleReference?.error || "角色已不存在，无法创建视频任务。";
+      await db.updateAsync(
+        { _id: taskRecord._id },
+        { $set: { status: "failed", failedAt: new Date().toISOString(), providerError: error } },
+      );
+      await notifyVideoTaskFailure(taskRecord.chatId);
+      return;
+    }
+
+    const submitted = await submitSeedanceVideoTask({
+      prompt: taskRecord.prompt,
+      ratio: taskRecord.ratio,
+      duration: taskRecord.duration,
+      generateAudio: taskRecord.generateAudio,
+      allowOnScreenText: taskRecord.allowOnScreenText === true,
+      referenceImage: roleReference,
+    });
+    if (!submitted.ok) {
+      await db.updateAsync(
+        { _id: taskRecord._id },
+        {
+          $set: {
+            status: "failed",
+            failedAt: new Date().toISOString(),
+            providerError: submitted.error,
+          },
+        },
+      );
+      await notifyVideoTaskFailure(taskRecord.chatId);
+      return;
+    }
+
+    const submittedAt = new Date().toISOString();
+    await db.updateAsync(
+      { _id: taskRecord._id },
+      {
+        $set: {
+          status: "queued",
+          remoteTaskId: submitted.taskId,
+          resolution: submitted.resolution,
+          ratio: submitted.ratio,
+          duration: submitted.duration,
+          roleReferenceUsed: true,
+          submittedAt,
+        },
+      },
+    );
+    taskRecord = {
+      ...taskRecord,
+      status: "queued",
+      remoteTaskId: submitted.taskId,
+      resolution: submitted.resolution,
+      ratio: submitted.ratio,
+      duration: submitted.duration,
+      roleReferenceUsed: true,
+    };
   }
 
   const createdAt = new Date(taskRecord.createdAt).valueOf();
@@ -1767,7 +1868,7 @@ async function processVideoTaskDelivery(taskRecordId) {
 async function resumePendingVideoTasks() {
   const tasks = await db.findAsync({ type: "video-generation-task" });
   for (const task of tasks) {
-    if (["queued", "processing"].includes(task.status)) {
+    if (["submitting", "queued", "processing"].includes(task.status)) {
       scheduleVideoTaskDelivery(task._id);
     }
   }
@@ -1788,12 +1889,35 @@ function normalizeImageCaption(rawCaption) {
   return caption.slice(0, 900);
 }
 
-async function deliverCharacterImage(ctx, image, rawCaption) {
+function normalizeImageProgressMessage(rawMessage, rawCaption, { operation }) {
+  const message =
+    typeof rawMessage === "string"
+      ? rawMessage.replace(/\s+/g, " ").trim()
+      : "";
+  if (message) {
+    return message.slice(0, 500);
+  }
+
+  const caption =
+    typeof rawCaption === "string"
+      ? rawCaption.replace(/\s+/g, " ").trim()
+      : "";
+  if (caption) {
+    return caption.slice(0, 500);
+  }
+
+  return operation === "edit"
+    ? "好，这一笔交给我来收尾。"
+    : "好呀，这一幕我会认真替你留住。";
+}
+
+async function deliverCharacterImage(chatId, image, rawCaption) {
   const caption = normalizeImageCaption(rawCaption);
 
   try {
     if (image.b64Json) {
-      await ctx.replyWithPhoto(
+      await bot.telegram.sendPhoto(
+        chatId,
         { source: Buffer.from(image.b64Json, "base64"), filename: "character.png" },
         { caption },
       );
@@ -1814,19 +1938,176 @@ async function deliverCharacterImage(ctx, image, rawCaption) {
       const contentType = download.headers.get("content-type") || "";
       const extension = contentType.includes("jpeg") ? "jpg" : "png";
       const source = Buffer.from(await download.arrayBuffer());
-      await ctx.replyWithPhoto(
+      await bot.telegram.sendPhoto(
+        chatId,
         { source, filename: `character.${extension}` },
         { caption },
       );
       return { delivered: true };
     } catch (downloadError) {
       console.warn("下载图片后上传失败，改由 Telegram 直接读取 URL:", downloadError.message);
-      await ctx.replyWithPhoto(image.url, { caption });
+      await bot.telegram.sendPhoto(chatId, image.url, { caption });
       return { delivered: true };
     }
   } catch (error) {
     console.error("发送角色图片失败:", error);
     return { delivered: false };
+  }
+}
+
+async function notifyImageTaskFailure(chatId) {
+  await bot.telegram
+    .sendMessage(chatId, "这次照片没能顺利洗出来。稍后换个描述再试试吧。")
+    .catch((error) => console.warn("发送图片失败通知失败:", error.message));
+}
+
+function scheduleImageTask(taskRecordId) {
+  if (!taskRecordId || activeImageTaskRuns.has(taskRecordId)) {
+    return;
+  }
+
+  activeImageTaskRuns.add(taskRecordId);
+  void processImageTask(taskRecordId)
+    .catch((error) => console.error("处理图片生成任务失败:", error))
+    .finally(() => activeImageTaskRuns.delete(taskRecordId));
+}
+
+async function getTaskRole(roleName) {
+  const role = findRole(await getRoles(), roleName);
+  return role?.id ? role : null;
+}
+
+async function processImageTask(taskRecordId) {
+  const task = await db.findOneAsync({
+    _id: taskRecordId,
+    type: "image-generation-task",
+  });
+  if (!task || !["queued", "processing"].includes(task.status)) {
+    return;
+  }
+
+  await db.updateAsync(
+    { _id: task._id },
+    { $set: { status: "processing", startedAt: new Date().toISOString() } },
+  );
+
+  try {
+    const role = await getTaskRole(task.roleName);
+    if (!role) {
+      throw new Error("角色已不存在，无法继续生成图片。");
+    }
+
+    let image;
+    let roleReference = null;
+    if (task.includeCurrentRole === true || task.saveAsRoleReference === true) {
+      const loadedReference = await loadRoleReferenceImageForRole(role);
+      if (loadedReference.ok) {
+        roleReference = loadedReference;
+      } else if (task.kind === "edit") {
+        throw new Error(loadedReference.error);
+      }
+    }
+
+    if (task.kind === "edit") {
+      const reference = await imageHistory.load({
+        scope: { chatId: task.chatId, userId: task.userId },
+        roleName: task.roleName,
+        referenceId: task.referenceId,
+      });
+      if (!reference.ok) {
+        throw new Error(reference.error);
+      }
+      image = await requestReferenceImageEdit({
+        referenceImage: reference.image,
+        mimeType: reference.mimeType,
+        roleName: task.roleName,
+        instruction: task.instruction,
+        editType: task.editType,
+        roleReference,
+      });
+    } else {
+      image = await requestCharacterImage(task.prompt, { roleReference });
+    }
+
+    if (!image?.ok) {
+      throw new Error(image?.error || "图片服务没有返回可用结果。");
+    }
+
+    let savedRoleReference = null;
+    if (task.saveAsRoleReference === true) {
+      try {
+        const generatedImage = await readGeneratedCharacterImage(image);
+        savedRoleReference = await saveRoleReferenceImage({
+          role,
+          scope: { chatId: task.chatId, userId: task.userId },
+          image: generatedImage.image,
+          mimeType: generatedImage.mimeType,
+          source: "generated",
+        });
+      } catch (error) {
+        console.error("保存生成的角色设定图失败:", error);
+        savedRoleReference = {
+          ok: false,
+          error: "图片已生成，但保存为角色设定图失败。请确认图片可下载后重试。",
+        };
+      }
+    }
+
+    const caption = normalizeImageCaption(task.caption);
+    const delivery = await deliverCharacterImage(task.chatId, image, caption);
+    if (!delivery.delivered) {
+      throw new Error("图片已生成，但发送到 Telegram 失败。");
+    }
+
+    const savedHistoryReference = await saveGeneratedImageToHistory({
+      scope: { chatId: task.chatId, userId: task.userId },
+      roleName: task.roleName,
+      image,
+      sourceLabel: task.kind === "edit" ? "图片编辑结果" : "角色生成图片",
+      caption,
+    });
+    await db.updateAsync(
+      { _id: task._id },
+      {
+        $set: {
+          status: "delivered",
+          completedAt: new Date().toISOString(),
+          roleReferenceUsed: Boolean(roleReference),
+          roleReferenceSaved: savedRoleReference?.ok === true,
+          ...(savedHistoryReference?.ok
+            ? { historyReferenceId: savedHistoryReference.referenceId }
+            : {}),
+          ...(savedRoleReference && !savedRoleReference.ok
+            ? { warning: savedRoleReference.error }
+            : {}),
+        },
+      },
+    );
+  } catch (error) {
+    console.error("图片后台任务失败:", error);
+    await db.updateAsync(
+      { _id: task._id },
+      {
+        $set: {
+          status: "failed",
+          failedAt: new Date().toISOString(),
+          providerError: String(error.message || error).slice(0, 300),
+        },
+      },
+    );
+    await notifyImageTaskFailure(task.chatId);
+  }
+}
+
+async function resumePendingImageTasks() {
+  const tasks = await db.findAsync({ type: "image-generation-task" });
+  for (const task of tasks) {
+    if (["queued", "processing"].includes(task.status)) {
+      if (task.status === "processing") {
+        await db.updateAsync({ _id: task._id }, { $set: { status: "queued" } });
+      }
+      scheduleImageTask(task._id);
+    }
   }
 }
 
@@ -1881,86 +2162,38 @@ async function executeToolCall(
       imageGenerationState.used = true;
     }
 
-    await ctx.reply("先别眨眼——我去把刚才那一幕冲洗出来。✨");
-    const shouldUseRoleReference =
-      args.include_current_role === true || args.save_as_role_reference === true;
-    let roleReference = null;
-    let roleReferenceWarning = "";
-    if (shouldUseRoleReference) {
-      const loadedReference = await loadCurrentRoleReferenceImage(ctx);
-      if (loadedReference.ok) {
-        roleReference = loadedReference;
-      } else {
-        roleReferenceWarning = loadedReference.error;
-      }
+    const scope = getScope(ctx);
+    const session = scope ? await findActiveSession(scope) : null;
+    if (!scope || !session?.roleName) {
+      return { ok: false, error: "请先用 /newchat 开启角色对话，再生成图片。" };
     }
 
-    const image = await requestCharacterImage(args.prompt, { roleReference });
-    if (!image.ok) {
-      return image;
-    }
-
-    let savedRoleReference = null;
-    if (args.save_as_role_reference === true) {
-      try {
-        const generatedImage = await readGeneratedCharacterImage(image);
-        savedRoleReference = await saveCurrentRoleReferenceImage(ctx, {
-          ...generatedImage,
-          source: "generated",
-        });
-      } catch (error) {
-        console.error("保存生成的角色设定图失败:", error);
-        savedRoleReference = {
-          ok: false,
-          error: "图片已生成，但保存为角色设定图失败。请确认图片可下载后重试。",
-        };
-      }
-    }
-
-    const caption = normalizeImageCaption(args.caption);
-    const delivery = await deliverCharacterImage(ctx, image, caption);
-    if (!delivery.delivered) {
-      return { ok: false, error: "图片已生成，但发送到 Telegram 失败。" };
-    }
-    const savedHistoryReference = await saveImageToCurrentHistory(ctx, {
-      image,
-      sourceLabel: "角色生成图片",
-      caption,
+    await ctx.reply(
+      normalizeImageProgressMessage(args.progress_message, args.caption, {
+        operation: "generate",
+      }),
+    );
+    const now = new Date().toISOString();
+    const taskRecord = await db.insertAsync({
+      type: "image-generation-task",
+      kind: "generate",
+      userId: scope.userId,
+      chatId: scope.chatId,
+      roleName: session.roleName,
+      prompt: args.prompt,
+      caption: normalizeImageCaption(args.caption),
+      includeCurrentRole: args.include_current_role === true,
+      saveAsRoleReference: args.save_as_role_reference === true,
+      status: "queued",
+      createdAt: now,
     });
-    if (savedRoleReference && !savedRoleReference.ok) {
-      return {
-        ok: true,
-        imageDelivered: true,
-        roleReferenceSaved: false,
-        ...(savedHistoryReference.ok
-          ? { historyReferenceId: savedHistoryReference.referenceId }
-          : {}),
-        warning: savedRoleReference.error,
-        caption,
-      };
-    }
-    return savedRoleReference?.ok
-      ? {
-          ok: true,
-          imageDelivered: true,
-          roleReferenceSaved: true,
-          roleName: savedRoleReference.roleName,
-          roleReferenceUsed: Boolean(roleReference),
-          ...(savedHistoryReference.ok
-            ? { historyReferenceId: savedHistoryReference.referenceId }
-            : {}),
-          caption,
-        }
-      : {
-          ok: true,
-          imageDelivered: true,
-          roleReferenceUsed: Boolean(roleReference),
-          ...(savedHistoryReference.ok
-            ? { historyReferenceId: savedHistoryReference.referenceId }
-            : {}),
-          ...(roleReferenceWarning ? { warning: roleReferenceWarning } : {}),
-          caption,
-        };
+    scheduleImageTask(taskRecord._id);
+    return {
+      ok: true,
+      imageQueued: true,
+      taskId: taskRecord._id,
+      roleName: session.roleName,
+    };
   }
 
   if (toolCall.function.name === "generate_character_video") {
@@ -1977,44 +2210,33 @@ async function executeToolCall(
       return roleReference;
     }
 
-    await ctx.sendChatAction("upload_video").catch(() => undefined);
-    const task = await submitSeedanceVideoTask({
-      prompt: args.prompt,
-      ratio: args.ratio,
-      duration: args.duration,
-      generateAudio: args.generate_audio,
-      allowOnScreenText: args.allow_on_screen_text === true,
-      referenceImage: roleReference,
-    });
-    if (!task.ok) {
-      return task;
-    }
-
     const now = new Date().toISOString();
     const taskRecord = await db.insertAsync({
       type: "video-generation-task",
-      remoteTaskId: task.taskId,
       userId: scope.userId,
       chatId: scope.chatId,
       caption: normalizeVideoCaption(args.caption),
-      status: "queued",
+      prompt: args.prompt,
+      generateAudio: args.generate_audio,
+      allowOnScreenText: args.allow_on_screen_text === true,
+      status: "submitting",
       model: SEEDANCE_VIDEO_MODEL,
-      resolution: task.resolution,
-      ratio: task.ratio,
-      duration: task.duration,
+      resolution: SEEDANCE_VIDEO_RESOLUTION,
+      ratio: normalizeVideoRatio(args.ratio),
+      duration: normalizeVideoDuration(args.duration),
       roleName: roleReference.roleName,
       roleReferenceUsed: true,
       createdAt: now,
     });
     scheduleVideoTaskDelivery(taskRecord._id);
-    await ctx.reply("导演椅空出来啦——镜头已经开拍，成片一好我就马上递给你。🎬");
+    await ctx.reply("导演椅空出来啦——分镜已经递进后台，成片一好我就马上递给你。🎬");
     return {
       ok: true,
       videoQueued: true,
-      taskId: task.taskId,
-      resolution: task.resolution,
-      ratio: task.ratio,
-      duration: task.duration,
+      taskId: taskRecord._id,
+      resolution: taskRecord.resolution,
+      ratio: taskRecord.ratio,
+      duration: taskRecord.duration,
       roleName: roleReference.roleName,
       roleReferenceUsed: true,
     };
@@ -2080,7 +2302,6 @@ async function executeToolCall(
       };
     }
 
-    let roleReference = null;
     if (args.include_current_role === true) {
       const loadedReference = await loadCurrentRoleReferenceImage(ctx);
       if (!loadedReference.ok) {
@@ -2096,7 +2317,6 @@ async function executeToolCall(
             "当前 NewAPI 图片编辑接口只能提交一张参考图，无法同时锁定场景和角色人设。为避免角色画风漂移，本次角色入景/换装已拒绝；请切换到 Seedream。",
         };
       }
-      roleReference = loadedReference;
     }
 
     imageEditState?.usedReferenceIds.add(selectedReference.referenceId);
@@ -2104,41 +2324,49 @@ async function executeToolCall(
       imageEditReference.used = true;
     }
 
-    await ctx.reply("照片先借我施一点小魔法——改好就立刻递回给你。✨");
-    const image = await requestReferenceImageEdit({
-      referenceImage: selectedReference.image,
-      mimeType: selectedReference.mimeType,
-      roleName: session.roleName,
-      instruction: args.instruction,
-      editType: args.edit_type,
-      roleReference,
-    });
-    if (!image.ok) {
-      return image;
+    let taskReferenceId = selectedReference.referenceId;
+    if (taskReferenceId === "current") {
+      const savedReference = await imageHistory.save({
+        scope,
+        roleName: session.roleName,
+        sourceLabel: selectedReference.sourceLabel || "图片编辑输入",
+        caption: selectedReference.caption || "",
+        image: selectedReference.image,
+        mimeType: selectedReference.mimeType,
+      });
+      if (!savedReference.ok) {
+        return savedReference;
+      }
+      taskReferenceId = savedReference.referenceId;
     }
 
-    const caption = normalizeImageCaption(args.caption);
-    const delivery = await deliverCharacterImage(ctx, image, caption);
-    const savedHistoryReference = delivery.delivered
-      ? await saveImageToCurrentHistory(ctx, {
-          image,
-          sourceLabel: "图片编辑结果",
-          caption,
-        })
-      : null;
-    return delivery.delivered
-      ? {
-          ok: true,
-          imageDelivered: true,
-          editType: normalizeImageEditType(args.edit_type),
-          referenceId: selectedReference.referenceId,
-          roleReferenceUsed: getActiveImageProvider() === "seedream" && Boolean(roleReference),
-          ...(savedHistoryReference?.ok
-            ? { historyReferenceId: savedHistoryReference.referenceId }
-            : {}),
-          caption,
-        }
-      : { ok: false, error: "图片已编辑，但发送到 Telegram 失败。" };
+    await ctx.reply(
+      normalizeImageProgressMessage(args.progress_message, args.caption, {
+        operation: "edit",
+      }),
+    );
+    const taskRecord = await db.insertAsync({
+      type: "image-generation-task",
+      kind: "edit",
+      userId: scope.userId,
+      chatId: scope.chatId,
+      roleName: session.roleName,
+      referenceId: taskReferenceId,
+      instruction: args.instruction,
+      editType: normalizeImageEditType(args.edit_type),
+      caption: normalizeImageCaption(args.caption),
+      includeCurrentRole: args.include_current_role === true,
+      status: "queued",
+      createdAt: new Date().toISOString(),
+    });
+    scheduleImageTask(taskRecord._id);
+    return {
+      ok: true,
+      imageQueued: true,
+      taskId: taskRecord._id,
+      editType: normalizeImageEditType(args.edit_type),
+      referenceId: taskReferenceId,
+    };
   }
 
   const mcdTool = mcdContext?.getRemoteTool(toolCall.function.name);
@@ -2389,6 +2617,180 @@ async function runModelWithTools(
   throw new Error("工具调用流程异常结束。");
 }
 
+function getConversationTaskKey(scope) {
+  return `${scope.chatId}:${scope.userId}`;
+}
+
+function createBackgroundContext({ chatId, userId, message = null }) {
+  const chat = { id: chatId, type: "private" };
+  const from = { id: userId };
+  return {
+    chat,
+    from,
+    message: message || { chat, from },
+    telegram: bot.telegram,
+    reply: (text, extra) => bot.telegram.sendMessage(chatId, text, extra),
+    replyWithPhoto: (photo, extra) => bot.telegram.sendPhoto(chatId, photo, extra),
+    replyWithDocument: (document, extra) => bot.telegram.sendDocument(chatId, document, extra),
+    sendChatAction: (action) => bot.telegram.sendChatAction(chatId, action),
+  };
+}
+
+function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
+  const key = getConversationTaskKey(scope);
+  if (activeConversationTaskRuns.has(key)) {
+    return;
+  }
+
+  const previousTimer = conversationDebounceTimers.get(key);
+  if (previousTimer) {
+    clearTimeout(previousTimer);
+  }
+
+  const timer = setTimeout(() => {
+    conversationDebounceTimers.delete(key);
+    if (activeConversationTaskRuns.has(key)) {
+      return;
+    }
+    activeConversationTaskRuns.add(key);
+    void runInSessionQueue(scope, () => processConversationTask(scope))
+      .catch((error) => console.error("处理会话后台任务失败:", error))
+      .finally(async () => {
+        activeConversationTaskRuns.delete(key);
+        const pending = await db.findOneAsync({
+          type: "conversation-message-task",
+          chatId: scope.chatId,
+          userId: scope.userId,
+          status: "pending",
+        });
+        if (pending) {
+          scheduleConversationTask(scope);
+        }
+      });
+  }, Math.max(0, delayMs));
+  timer.unref?.();
+  conversationDebounceTimers.set(key, timer);
+}
+
+async function enqueueConversationMessage(ctx, scope, text) {
+  const messageId = ctx.message?.message_id;
+  if (messageId !== undefined) {
+    const duplicate = await db.findOneAsync({
+      type: "conversation-message-task",
+      chatId: scope.chatId,
+      userId: scope.userId,
+      telegramMessageId: messageId,
+    });
+    if (duplicate) {
+      return duplicate;
+    }
+  }
+
+  const now = new Date().toISOString();
+  const task = await db.insertAsync({
+    type: "conversation-message-task",
+    chatId: scope.chatId,
+    userId: scope.userId,
+    telegramMessageId: messageId,
+    text,
+    status: "pending",
+    receivedAt: now,
+    createdAt: now,
+  });
+  scheduleConversationTask(scope);
+  return task;
+}
+
+async function processConversationTask(scope) {
+  const pendingTasks = (await db.findAsync({
+    type: "conversation-message-task",
+    chatId: scope.chatId,
+    userId: scope.userId,
+    status: "pending",
+  })).sort((left, right) => {
+    const byTime = String(left.receivedAt).localeCompare(String(right.receivedAt));
+    return byTime || Number(left.telegramMessageId || 0) - Number(right.telegramMessageId || 0);
+  });
+  if (pendingTasks.length === 0) {
+    return;
+  }
+
+  const taskIds = pendingTasks.map((task) => task._id);
+  await db.updateAsync(
+    { _id: { $in: taskIds }, status: "pending" },
+    { $set: { status: "processing", startedAt: new Date().toISOString() } },
+    { multi: true },
+  );
+
+  const ctx = createBackgroundContext({ chatId: scope.chatId, userId: scope.userId });
+  const session = await findActiveSession(scope);
+  if (!session || !Array.isArray(session.messages) || session.messages.length === 0) {
+    await db.updateAsync(
+      { _id: { $in: taskIds } },
+      { $set: { status: "discarded", completedAt: new Date().toISOString() } },
+      { multi: true },
+    );
+    return;
+  }
+
+  const messages = [
+    ...session.messages,
+    ...pendingTasks.map((task) => ({ role: "user", content: task.text })),
+  ];
+  const batchText = pendingTasks.map((task) => task.text).join("\n");
+  try {
+    await ctx.sendChatAction("typing").catch(() => undefined);
+    let imageEditHistory = [];
+    try {
+      imageEditHistory = await getImageEditHistory(scope, session.roleName);
+    } catch (error) {
+      console.warn("读取历史图片失败:", error.message);
+    }
+    const result = await runModelWithTools(ctx, messages, {
+      imageEditHistory,
+      forceImageEdit: isLikelyImageEditIntent(batchText, {
+        hasHistory: imageEditHistory.length > 0,
+      }),
+    });
+    await db.updateAsync(
+      { _id: session._id, type: "chat-session" },
+      { $set: { messages: result.messages, updatedAt: new Date().toISOString() } },
+    );
+    await db.updateAsync(
+      { _id: { $in: taskIds } },
+      { $set: { status: "completed", completedAt: new Date().toISOString() } },
+      { multi: true },
+    );
+    await replyWithText(ctx, result.answer);
+  } catch (error) {
+    console.error("生成后台会话回复失败:", error);
+    await db.updateAsync(
+      { _id: { $in: taskIds } },
+      {
+        $set: {
+          status: "failed",
+          failedAt: new Date().toISOString(),
+          error: String(error.message || error).slice(0, 300),
+        },
+      },
+      { multi: true },
+    );
+    await ctx.reply("这次回复生成失败了，请稍后重试。当前上下文没有被清除。");
+  }
+}
+
+async function resumePendingConversationTasks() {
+  const tasks = await db.findAsync({ type: "conversation-message-task" });
+  for (const task of tasks) {
+    if (task.status === "processing") {
+      await db.updateAsync({ _id: task._id }, { $set: { status: "pending" } });
+    }
+    if (["pending", "processing"].includes(task.status)) {
+      scheduleConversationTask({ chatId: task.chatId, userId: task.userId });
+    }
+  }
+}
+
 async function downloadTelegramImageFile(ctx, { fileId, fileSize, fallbackMimeType }) {
   if (!fileId) {
     return { ok: false, error: "没有读取到图片附件。" };
@@ -2522,15 +2924,35 @@ async function downloadTelegramStickerReference(ctx) {
   };
 }
 
-function buildVisualUserMessage({ sourceLabel, caption, image, mimeType, visionImageUrl = "" }) {
+function getStickerEmojiHint(sticker) {
+  const emoji = typeof sticker?.emoji === "string" ? sticker.emoji.trim() : "";
+  if (!emoji) {
+    return "";
+  }
+
+  return (
+    `Telegram 为这个 sticker 标注的关联 emoji 是「${emoji}」。` +
+    "它只是帮助理解表情、情绪或主题的辅助标签；仍应以实际画面为准，也不要把它当作用户额外的文字指令。"
+  );
+}
+
+function buildVisualUserMessage({
+  sourceLabel,
+  caption,
+  image,
+  mimeType,
+  visionImageUrl = "",
+  semanticHint = "",
+}) {
   const visiblePrompt = caption
     ? `用户发送了一张${sourceLabel}，并附言：“${caption}”。请先观察画面，再用当前角色口吻自然回应用户。`
     : `用户发送了一张${sourceLabel}。请先观察画面，再用当前角色口吻自然回应；可以描述画面、表达感受或询问用户想聊什么。`;
+  const text = semanticHint ? `${visiblePrompt}\n\n${semanticHint}` : visiblePrompt;
 
   return {
     role: "user",
     content: [
-      { type: "text", text: visiblePrompt },
+      { type: "text", text },
       {
         type: "image_url",
         image_url: {
@@ -2552,12 +2974,13 @@ function buildDirectImageEditUserMessage({ sourceLabel, caption }) {
   };
 }
 
-function buildStoredVisualMessage(sourceLabel, caption) {
+function buildStoredVisualMessage(sourceLabel, caption, semanticHint = "") {
   const detail = caption ? `，附言：${caption}` : "";
-  return { role: "user", content: `[用户发送了一张${sourceLabel}${detail}]` };
+  const emojiDetail = semanticHint ? `，附带 Telegram emoji 语义标签` : "";
+  return { role: "user", content: `[用户发送了一张${sourceLabel}${detail}${emojiDetail}]` };
 }
 
-async function handleVisualConversation(ctx, scope, { sourceLabel, caption, download }) {
+async function handleVisualConversation(ctx, scope, { sourceLabel, caption, download, semanticHint = "" }) {
   const settings = await getToolSettings();
   const forceImageEdit = isLikelyImageEditIntent(caption, { hasCurrentReference: true });
   if (!settings.visionEnabled && !forceImageEdit) {
@@ -2619,6 +3042,7 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
         image: reference.image,
         mimeType: reference.mimeType,
         visionImageUrl: reference.visionImageUrl,
+        semanticHint,
       });
   const modelMessages = [...savedMessages, incomingMessage];
   const imageEditReference = {
@@ -2641,7 +3065,7 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
     const generatedMessages = result.messages.slice(modelMessages.length);
     const messagesToPersist = [
       ...savedMessages,
-      buildStoredVisualMessage(sourceLabel, caption),
+      buildStoredVisualMessage(sourceLabel, caption, semanticHint),
       ...generatedMessages,
     ];
     await db.updateAsync(
@@ -3251,53 +3675,37 @@ bot.on(message("text"), async (ctx) => {
     return;
   }
 
-  await runInSessionQueue(scope, async () => {
-    if (isAdmin(ctx) && isPrivateChat(ctx)) {
-      const activeAdminFlow = await adminFlow.find(scope);
-      if (activeAdminFlow) {
-        await adminFlow.handle(ctx, scope, activeAdminFlow, text);
-        return;
-      }
-    }
-
-    const session = await findActiveSession(scope);
-    if (!session) {
-      await ctx.reply("请先用 /list 选择角色，再发送 /newchat <角色名字> 开始对话。");
-      return;
-    }
-
-    const messages = Array.isArray(session.messages) ? [...session.messages] : [];
-    if (messages.length === 0) {
-      await ctx.reply("当前会话数据不完整，请重新使用 /newchat 开启对话。");
-      return;
-    }
-
-    messages.push({ role: "user", content: text });
-    await ctx.sendChatAction("typing");
-
-    try {
-      let imageEditHistory = [];
-      try {
-        imageEditHistory = await getImageEditHistory(scope, session.roleName);
-      } catch (error) {
-        console.warn("读取历史图片失败:", error.message);
-      }
-      const result = await runModelWithTools(ctx, messages, {
-        imageEditHistory,
-        forceImageEdit: isLikelyImageEditIntent(text, {
-          hasHistory: imageEditHistory.length > 0,
-        }),
+  if (isAdmin(ctx) && isPrivateChat(ctx)) {
+    const activeAdminFlow = await adminFlow.find(scope);
+    if (activeAdminFlow) {
+      const backgroundCtx = createBackgroundContext({
+        chatId: scope.chatId,
+        userId: scope.userId,
+        message: ctx.message,
       });
-      await db.updateAsync(
-        { _id: session._id, type: "chat-session" },
-        { $set: { messages: result.messages, updatedAt: new Date().toISOString() } },
-      );
-      await replyWithText(ctx, result.answer);
-    } catch (error) {
-      console.error("生成回复失败:", error);
-      await ctx.reply("这次回复生成失败了，请稍后重试。当前上下文没有被清除。");
+      void runInSessionQueue(scope, () => adminFlow.handle(backgroundCtx, scope, activeAdminFlow, text))
+        .catch((error) => console.error("处理管理员输入失败:", error));
+      return;
     }
-  });
+  }
+
+  const session = await findActiveSession(scope);
+  if (!session) {
+    await ctx.reply("请先用 /list 选择角色，再发送 /newchat <角色名字> 开始对话。");
+    return;
+  }
+  if (!Array.isArray(session.messages) || session.messages.length === 0) {
+    await ctx.reply("当前会话数据不完整，请重新使用 /newchat 开启对话。");
+    return;
+  }
+
+  try {
+    await enqueueConversationMessage(ctx, scope, text);
+    void ctx.sendChatAction("typing").catch(() => undefined);
+  } catch (error) {
+    console.error("写入会话后台任务失败:", error);
+    await ctx.reply("这条消息暂时没能排进处理队列，请稍后重试。");
+  }
 });
 
 bot.on(message("photo"), async (ctx) => {
@@ -3310,17 +3718,24 @@ bot.on(message("photo"), async (ctx) => {
     return;
   }
 
-  await runInSessionQueue(scope, async () => {
-    if (await handleAdminRoleReferencePhoto(ctx, scope)) {
+  const backgroundCtx = createBackgroundContext({
+    chatId: scope.chatId,
+    userId: scope.userId,
+    message: ctx.message,
+  });
+  void runInSessionQueue(scope, async () => {
+    if (await handleAdminRoleReferencePhoto(backgroundCtx, scope)) {
       return;
     }
 
-    await handleVisualConversation(ctx, scope, {
+    await handleVisualConversation(backgroundCtx, scope, {
       sourceLabel: "图片",
-      caption: typeof ctx.message?.caption === "string" ? ctx.message.caption.trim() : "",
-      download: () => downloadTelegramPhotoReference(ctx),
+      caption: typeof backgroundCtx.message?.caption === "string"
+        ? backgroundCtx.message.caption.trim()
+        : "",
+      download: () => downloadTelegramPhotoReference(backgroundCtx),
     });
-  });
+  }).catch((error) => console.error("处理图片后台任务失败:", error));
 });
 
 bot.on(message("sticker"), async (ctx) => {
@@ -3333,13 +3748,19 @@ bot.on(message("sticker"), async (ctx) => {
     return;
   }
 
-  await runInSessionQueue(scope, async () => {
-    await handleVisualConversation(ctx, scope, {
+  const backgroundCtx = createBackgroundContext({
+    chatId: scope.chatId,
+    userId: scope.userId,
+    message: ctx.message,
+  });
+  void runInSessionQueue(scope, async () => {
+    await handleVisualConversation(backgroundCtx, scope, {
       sourceLabel: "sticker",
       caption: "",
-      download: () => downloadTelegramStickerReference(ctx),
+      download: () => downloadTelegramStickerReference(backgroundCtx),
+      semanticHint: getStickerEmojiHint(backgroundCtx.message?.sticker),
     });
-  });
+  }).catch((error) => console.error("处理 sticker 后台任务失败:", error));
 });
 
 async function handleLocationUpdate(ctx) {
@@ -3377,6 +3798,8 @@ async function launchBot() {
   }
   lifeAssistant.startScheduler(getToolSettings);
   await resumePendingVideoTasks();
+  await resumePendingImageTasks();
+  await resumePendingConversationTasks();
   await bot.launch();
   console.log("Telegram bot 已启动");
 }
