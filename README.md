@@ -106,6 +106,8 @@ SEEDREAM_LITE_API_KEY=your_bearer_key node test-seedream-lite.mjs \
 
 部分 OpenAI 兼容视觉服务不接受 `data:image/...;base64,...`，仅接受公网 HTTPS 图片 URL。可设置 `VISION_USE_TELEGRAM_FILE_URL=true` 让图片理解请求直接使用 Telegram 文件下载 URL；该 URL 包含 Bot Token，视觉提供商将能看到该凭据，存在高风险，仅在明确接受风险时使用。机器人不会把该 URL 写入数据库，模型安全追踪日志也会自动打码；长期方案仍应使用自建的短时签名图片代理。
 
+当前也内置了原生 HTTP 视觉素材代理，默认监听 `0.0.0.0:3000`，并用 `VISION_ASSET_PUBLIC_BASE_URL` 生成 10 分钟有效的随机 URL。远程视觉提供商需要能访问该地址；部署到 `160.16.146.27` 时可使用 `http://160.16.146.27:3000`，并在防火墙放行 TCP 3000。由于一次视觉请求可能触发多轮 Function Call，同一个 URL 会在有效期内允许重复读取，过期后自动清理；测试环境可用 HTTP，正式环境建议放到 HTTPS 反向代理后。
+
 ## 角色视频（Seedance）
 
 在 `.env` 配置 VVDance 的开发者 API Key（以 Bearer Token 传递）：

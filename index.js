@@ -1,4 +1,6 @@
 const fs = require("node:fs");
+const http = require("node:http");
+const crypto = require("node:crypto");
 const path = require("node:path");
 const OpenAI = require("openai");
 const { Telegraf } = require("telegraf");
@@ -99,6 +101,12 @@ const HAS_SEPARATE_VISION_PROVIDER = Boolean(
 const VISION_USE_TELEGRAM_FILE_URL = ["true", "1", "yes", "on"].includes(
   String(process.env.VISION_USE_TELEGRAM_FILE_URL || "false").trim().toLowerCase(),
 );
+const VISION_ASSET_SERVER_HOST = process.env.VISION_ASSET_SERVER_HOST || "0.0.0.0";
+const VISION_ASSET_SERVER_PORT = Number(process.env.VISION_ASSET_SERVER_PORT || 3000);
+const VISION_ASSET_PUBLIC_BASE_URL = (
+  process.env.VISION_ASSET_PUBLIC_BASE_URL || "http://160.16.146.27:3000"
+).replace(/\/+$/, "");
+const VISION_ASSET_TTL_MS = 10 * 60 * 1_000;
 const DEFAULT_TOOL_SETTINGS = Object.freeze({
   timeEnabled: true,
   imageEnabled: false,
@@ -160,6 +168,8 @@ const videoHistory = createVideoHistory({
   assetsDir: CONVERSATION_VIDEO_ASSETS_DIR,
   maxBytes: MAX_VIDEO_REFERENCE_BYTES,
 });
+const visionAssetStore = new Map();
+let visionAssetServer = null;
 const roleStore = createRoleStore({
   db,
   rolesSeedFile: ROLES_SEED_FILE,
@@ -3612,12 +3622,101 @@ function getStickerEmojiHint(sticker) {
   );
 }
 
+function pruneVisionAssets() {
+  const now = Date.now();
+  for (const [token, asset] of visionAssetStore) {
+    if (!asset || asset.expiresAt <= now) {
+      visionAssetStore.delete(token);
+    }
+  }
+}
+
+function createVisionAssetUrl({ image, mimeType }) {
+  if (!Buffer.isBuffer(image) || image.length === 0 || !VISION_ASSET_PUBLIC_BASE_URL) {
+    return "";
+  }
+  pruneVisionAssets();
+  const token = crypto.randomBytes(24).toString("base64url");
+  visionAssetStore.set(token, {
+    image,
+    mimeType: /^image\/(?:jpeg|png|webp)$/i.test(String(mimeType || ""))
+      ? String(mimeType).toLowerCase()
+      : "image/jpeg",
+    expiresAt: Date.now() + VISION_ASSET_TTL_MS,
+  });
+  return `${VISION_ASSET_PUBLIC_BASE_URL}/vision-assets/${token}`;
+}
+
+function startVisionAssetServer() {
+  if (visionAssetServer) {
+    return Promise.resolve();
+  }
+  visionAssetServer = http.createServer((request, response) => {
+    const requestUrl = new URL(request.url || "/", "http://vision-assets.local");
+    if (requestUrl.pathname === "/healthz") {
+      response.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("ok");
+      return;
+    }
+
+    const match = requestUrl.pathname.match(/^\/vision-assets\/([A-Za-z0-9_-]+)$/);
+    if (!match || !["GET", "HEAD"].includes(request.method || "")) {
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("not found");
+      return;
+    }
+
+    const token = match[1];
+    const asset = visionAssetStore.get(token);
+    if (!asset || asset.expiresAt <= Date.now()) {
+      visionAssetStore.delete(token);
+      response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      response.end("expired");
+      return;
+    }
+
+    response.writeHead(200, {
+      "Cache-Control": "no-store, max-age=0",
+      "Content-Length": asset.image.length,
+      "Content-Type": asset.mimeType,
+      "X-Content-Type-Options": "nosniff",
+    });
+    if (request.method === "HEAD") {
+      response.end();
+      return;
+    }
+    response.end(asset.image);
+  });
+
+  return new Promise((resolve, reject) => {
+    const onError = (error) => {
+      visionAssetServer = null;
+      reject(error);
+    };
+    visionAssetServer.once("error", onError);
+    visionAssetServer.listen(
+      Number.isInteger(VISION_ASSET_SERVER_PORT) && VISION_ASSET_SERVER_PORT > 0
+        ? VISION_ASSET_SERVER_PORT
+        : 3000,
+      VISION_ASSET_SERVER_HOST,
+      () => {
+        visionAssetServer.off("error", onError);
+        console.log(
+          `视觉素材 HTTP 服务已启动：${VISION_ASSET_SERVER_HOST}:${VISION_ASSET_SERVER_PORT}`,
+        );
+        resolve();
+      },
+    );
+  });
+}
+
 function buildVisualUserMessage({
   sourceLabel,
   caption,
   image,
   mimeType,
   visionImageUrl = "",
+  visionAssetUrl = "",
   semanticHint = "",
 }) {
   const visiblePrompt = caption
@@ -3632,8 +3731,10 @@ function buildVisualUserMessage({
       {
         type: "image_url",
         image_url: {
-          url: /^https:\/\//i.test(visionImageUrl)
-            ? visionImageUrl
+          url: /^https?:\/\//i.test(visionAssetUrl)
+            ? visionAssetUrl
+            : /^https?:\/\//i.test(visionImageUrl)
+              ? visionImageUrl
             : `data:${mimeType};base64,${image.toString("base64")}`,
         },
       },
@@ -3819,6 +3920,10 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
         image: reference.image,
         mimeType: reference.mimeType,
         visionImageUrl: reference.visionImageUrl,
+        visionAssetUrl: createVisionAssetUrl({
+          image: reference.image,
+          mimeType: reference.mimeType,
+        }),
         semanticHint,
       });
   const modelMessages = [...savedMessages, incomingMessage];
@@ -4622,6 +4727,7 @@ bot.catch((error, ctx) => {
 
 async function launchBot() {
   await initializeRoleCatalog();
+  await startVisionAssetServer();
   if (ADMIN_USER_IDS.size === 0) {
     console.warn("未设置 TG_ADMIN_USER_IDS，/admin 将没有可用管理员。");
   }
