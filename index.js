@@ -14,7 +14,7 @@ const {
   createConversationExportFilename,
 } = require("./conversation-export");
 
-// require("dotenv").config({ path: path.join(__dirname, ".env") });
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const DATA_FILE = path.join(__dirname, "data");
 const ROLES_SEED_FILE = path.join(__dirname, "roles.json");
