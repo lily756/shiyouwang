@@ -69,6 +69,7 @@ web_modules/
 .env
 .env.*
 !.env.example
+!.env.minimax.example
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -146,3 +147,4 @@ data
 role-assets/
 conversation-image-assets/
 runtime-logs/
+agent-workspaces/

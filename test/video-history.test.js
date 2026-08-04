@@ -7,8 +7,8 @@ const path = require("node:path");
 const test = require("node:test");
 const { createVideoHistory } = require("../lib/video-history");
 
-function createMemoryDb() {
-  const records = [];
+function createMemoryDb(initialRecords = []) {
+  const records = [...initialRecords];
   const matches = (record, query) => Object.entries(query).every(([key, value]) => record[key] === value);
   return {
     async insertAsync(record) {
@@ -57,6 +57,43 @@ test("persists and reloads a Telegram video reference within its conversation sc
     assert.equal(loaded.ok, true);
     assert.equal(loaded.mimeType, "video/mp4");
     assert.equal(loaded.video.toString(), "fake-mp4-content");
+  } finally {
+    await fs.rm(assetsDir, { recursive: true, force: true });
+  }
+});
+
+test("can reload a Wasabi-backed reference after the local copy is gone", async () => {
+  const scope = { chatId: 100, userId: 200 };
+  const assetsDir = await fs.mkdtemp(path.join(os.tmpdir(), "localtest-video-remote-"));
+  const db = createMemoryDb([{
+    type: "chat-video-reference",
+    ...scope,
+    roleName: "小白",
+    referenceId: "vid_remote",
+    remoteObjectKey: "role-bot/video-history/remote.mp4",
+    mimeType: "video/mp4",
+    sourceLabel: "Wasabi 视频",
+    createdAt: new Date().toISOString(),
+  }]);
+  try {
+    const history = createVideoHistory({
+      db,
+      assetsDir,
+      maxBytes: 1024,
+      assetStore: {
+        isConfigured: () => true,
+        getBuffer: async ({ key }) => {
+          assert.equal(key, "role-bot/video-history/remote.mp4");
+          return Buffer.from("remote-mp4-content");
+        },
+      },
+    });
+
+    const listed = await history.list({ scope, roleName: "小白" });
+    assert.equal(listed.length, 1);
+    const loaded = await history.load({ scope, roleName: "小白", referenceId: "vid_remote" });
+    assert.equal(loaded.ok, true);
+    assert.equal(loaded.video.toString(), "remote-mp4-content");
   } finally {
     await fs.rm(assetsDir, { recursive: true, force: true });
   }

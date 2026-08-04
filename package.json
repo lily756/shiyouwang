@@ -12,9 +12,11 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
     "@modelcontextprotocol/sdk": "^1.13.0",
     "@seald-io/nedb": "^4.1.2",
     "dotenv": "^17.4.2",
+    "minimax-mcp-js": "^0.0.17",
     "openai": "^7.0.0",
     "telegraf": "^4.16.3"
   }

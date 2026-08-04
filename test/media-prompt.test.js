@@ -7,6 +7,7 @@ const {
   buildRoleReferenceImagePrompt,
   buildReferenceImageEditPrompt,
   buildSeedanceVideoPrompt,
+  buildMiniMaxH3VideoPrompt,
   getMediaPromptSystemInstruction,
 } = require("../lib/media-prompt");
 
@@ -45,6 +46,23 @@ test("guided mode keeps server-side constraints available", () => {
   assert.match(prompt, /参考素材绑定/);
   assert.match(prompt, /高清/);
   assert.match(prompt, /一只猫在窗边打哈欠/);
+});
+
+test("MiniMax H3 prompt removes Seedance-only reference syntax", () => {
+  const freeformPrompt = buildMiniMaxH3VideoPrompt(
+    "@图片1中的角色沿着海边走，借鉴@视频1的节奏",
+    { mode: "freeform" },
+  );
+  assert.equal(
+    freeformPrompt,
+    "参考图1中的角色沿着海边走，借鉴参考视频1的节奏",
+  );
+
+  const guidedPrompt = buildMiniMaxH3VideoPrompt("角色抬头微笑", {
+    mode: "guided",
+  });
+  assert.match(guidedPrompt, /H3 执行约束/);
+  assert.doesNotMatch(guidedPrompt, /@图片|@视频/);
 });
 
 test("freeform media prompt skill translates selfie intent without inventing role details", () => {

@@ -16,6 +16,65 @@ const MCD_MUTATING_TOOLS = new Set([
   "mall-create-order",
   "mall-create-order-physical",
 ]);
+const MCD_EXPLICIT_INTENT_PATTERN = /(?:麦当劳|金拱门|mcd(?:\b|[_-]|[\u4e00-\u9fff]))/iu;
+const MCD_UNRELATED_INTENT_PATTERN = /(?:视频|短片|图片|照片|图像|自拍|音频|语音|朗读|python|代码|沙箱|工作区|3d|三维|联网搜索|网页|提醒|记账|待办)/iu;
+
+function getMessageText(message) {
+  if (typeof message?.content === "string") {
+    return message.content;
+  }
+  if (!Array.isArray(message?.content)) {
+    return "";
+  }
+  return message.content
+    .map((part) => {
+      if (typeof part === "string") {
+        return part;
+      }
+      if (typeof part?.text === "string") {
+        return part.text;
+      }
+      return typeof part?.content === "string" ? part.content : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function hasMcDonaldsToolCall(message) {
+  return Array.isArray(message?.tool_calls)
+    && message.tool_calls.some((toolCall) => (
+      typeof toolCall?.function?.name === "string"
+      && toolCall.function.name.startsWith("mcd_")
+    ));
+}
+
+function shouldLoadMcDonaldsMcp(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return false;
+  }
+
+  const latestUserMessage = [...messages]
+    .reverse()
+    .find((message) => message?.role === "user");
+  const latestUserText = getMessageText(latestUserMessage).trim();
+  if (!latestUserText) {
+    return false;
+  }
+  if (MCD_EXPLICIT_INTENT_PATTERN.test(latestUserText)) {
+    return true;
+  }
+  // Allow short follow-ups such as “那优惠券呢？” after an active MCP
+  // exchange, but don't carry the MCP into an unrelated media/code request.
+  if (MCD_UNRELATED_INTENT_PATTERN.test(latestUserText) || latestUserText.length > 48) {
+    return false;
+  }
+
+  const recentMessages = messages.slice(-8);
+  return recentMessages.some((message) => (
+    MCD_EXPLICIT_INTENT_PATTERN.test(getMessageText(message))
+    || hasMcDonaldsToolCall(message)
+  ));
+}
 
 function toUserKey(userId) {
   return String(userId || "").trim();
@@ -726,4 +785,4 @@ function createMcDonaldsMcp({ db }) {
   };
 }
 
-module.exports = { createMcDonaldsMcp };
+module.exports = { createMcDonaldsMcp, shouldLoadMcDonaldsMcp };
