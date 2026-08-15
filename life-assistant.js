@@ -1223,7 +1223,7 @@ function createLifeAssistant({ db, bot }) {
         { _id: reminder._id, status: "pending" },
         { $set: { status: "sending", sendingAt: now } },
       );
-      if (!updated) {
+      if (!updated || updated.numAffected !== 1) {
         continue;
       }
 

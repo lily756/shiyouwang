@@ -3,10 +3,18 @@ const assert = require("node:assert/strict");
 const Datastore = require("@seald-io/nedb");
 const {
   buildFallbackSchedule,
+  buildSeededSchedule,
+  buildPhysicalStateChanges,
   createRoleScheduleManager,
+  DAILY_SEED_VERSION,
+  getDailyScheduleSeed,
   isBehaviorEntry,
   isIdleEntry,
+  isSleepEntry,
+  mergePhysicalState,
   normalizeScheduleEntries,
+  normalizePhysicalState,
+  ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE,
   ROLE_STATE_RECORD_TYPE,
   SCHEDULE_VERSION,
 } = require("../lib/role-schedule");
@@ -93,6 +101,349 @@ test("fallback schedule includes real departure preparation and commute stages",
   assert.equal(entries.some((entry) => entry.activity.includes("换衣服") && entry.activity.includes("钥匙")), true);
   assert.equal(entries.every((entry, index) => index === 0 || entry.startMinute === entries[index - 1].endMinute), true);
   assert.equal(entries.at(-1).endMinute, 1440);
+});
+
+test("builds a deterministic minute-level schedule from the role and date seed", () => {
+  const role = {
+    name: "小雨",
+    description: "喜欢安静生活、偶尔写作的角色",
+    systemPrompt: "你会在工作和创作之间安排平衡的生活。",
+  };
+  const dateKey = "2026-08-15";
+  const seed = getDailyScheduleSeed(role.name, dateKey);
+  const first = buildSeededSchedule({ role, dateKey, seed });
+  const second = buildSeededSchedule({ role, dateKey, seed });
+  const nextDay = buildSeededSchedule({
+    role,
+    dateKey: "2026-08-16",
+    seed: getDailyScheduleSeed(role.name, "2026-08-16"),
+  });
+
+  assert.deepEqual(first, second);
+  assert.notDeepEqual(first, nextDay);
+  assert.equal(first[0].startMinute, 0);
+  assert.equal(first.at(-1).endMinute, 1440);
+  assert.equal(first.every((entry) => Number.isInteger(entry.startMinute) && Number.isInteger(entry.endMinute)), true);
+  assert.equal(first.every((entry, index) => index === 0 || entry.startMinute === first[index - 1].endMinute), true);
+  assert.equal(first.some((entry) => entry.kind === "commute"), true);
+  assert.equal(first.some((entry) => entry.kind === "sleep"), true);
+});
+
+test("stores and forwards the daily seed when generating a schedule", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "安静的角色", systemPrompt: "你是小雨。" };
+  let generationInput;
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async (input) => {
+      generationInput = input;
+      return {
+        entries: [
+          { start: "00:00", end: "08:00", kind: "sleep", activity: "睡觉", location: "家" },
+          { start: "08:00", end: "24:00", kind: "rest", activity: "休息", location: "家" },
+        ],
+      };
+    },
+    logger: { warn() {} },
+  });
+  const date = new Date("2026-08-15T01:00:00.000Z");
+  const schedule = await manager.ensureDailySchedule(role, date);
+  const expectedSeed = getDailyScheduleSeed(role.name, "2026-08-15");
+
+  assert.equal(schedule.dailySeed, expectedSeed);
+  assert.equal(schedule.dailySeedVersion, DAILY_SEED_VERSION);
+  assert.equal(generationInput.seed, expectedSeed);
+  assert.equal(typeof generationInput.seedKey, "string");
+  assert.equal(typeof generationInput.random, "function");
+});
+
+test("normalizes and merges physical continuity state without inventing changes", () => {
+  const entries = normalizeScheduleEntries({
+    entries: [
+      {
+        start: "00:00",
+        end: "08:00",
+        kind: "rest",
+        activity: "在家休息",
+        location: "家",
+        physicalState: {
+          outfit: "灰色家居服",
+          carriedItems: ["钥匙"],
+          heldItems: ["手机"],
+          internalDevices: ["左耳人工耳蜗"],
+          bodyState: "精神正常",
+          limbStates: { leftArm: "自然下垂", rightHand: "握着手机" },
+        },
+      },
+      {
+        start: "08:00",
+        end: "10:00",
+        kind: "work",
+        activity: "专注工作",
+        location: "家",
+        physicalState: {
+          bodyState: "专注",
+          limbStates: { rightHand: "敲键盘" },
+        },
+      },
+      {
+        start: "10:00",
+        end: "12:00",
+        kind: "prepare",
+        activity: "整理并放下手中物品",
+        location: "家",
+        physicalState: {
+          outfit: null,
+          carriedItems: [],
+          heldItems: [],
+        },
+      },
+      {
+        start: "12:00",
+        end: "24:00",
+        kind: "rest",
+        activity: "继续休息",
+        location: "家",
+      },
+    ],
+  });
+
+  assert.deepEqual(entries[0].physicalState.heldItems, ["手机"]);
+  assert.equal(entries[0].physicalState.limbStates.rightHand, "握着手机");
+  assert.deepEqual(entries[1].physicalState, {
+    bodyState: "专注",
+    limbStates: { rightHand: "敲键盘" },
+  });
+
+  const merged = mergePhysicalState(entries[0].physicalState, entries[1].physicalState);
+  assert.equal(merged.outfit, "灰色家居服");
+  assert.deepEqual(merged.heldItems, ["手机"]);
+  assert.equal(merged.bodyState, "专注");
+  assert.equal(merged.limbStates.leftArm, "自然下垂");
+  assert.equal(merged.limbStates.rightHand, "敲键盘");
+
+  const cleared = mergePhysicalState(merged, entries[2].physicalState);
+  assert.equal(cleared.outfit, null);
+  assert.deepEqual(cleared.carriedItems, []);
+  assert.deepEqual(cleared.heldItems, []);
+  assert.deepEqual(buildPhysicalStateChanges(merged, cleared).heldItems, {
+    from: ["手机"],
+    to: [],
+    fromRecorded: true,
+    toRecorded: true,
+  });
+});
+
+test("normalizes legacy outfit and carried items into the physical state ledger", () => {
+  const state = normalizePhysicalState({
+    outfit: "外出服",
+    carriedItems: ["钱包"],
+    heldItems: ["雨伞"],
+    internal_devices: ["义眼"],
+    body_state: "有些疲惫",
+    limb_states: { left_leg: "轻微酸痛" },
+  });
+  assert.deepEqual(state, {
+    outfit: "外出服",
+    carriedItems: ["钱包"],
+    heldItems: ["雨伞"],
+    internalDevices: ["义眼"],
+    bodyState: "有些疲惫",
+    limbStates: { leftLeg: "轻微酸痛" },
+  });
+});
+
+test("rejects unannounced physical state changes in ordinary schedule entries", () => {
+  const entries = normalizeScheduleEntries({
+    entries: [
+      {
+        start: "00:00",
+        end: "08:00",
+        kind: "rest",
+        activity: "在家休息",
+        location: "家",
+        physicalState: { outfit: "家居服", heldItems: ["手机"] },
+      },
+      {
+        start: "08:00",
+        end: "12:00",
+        kind: "work",
+        activity: "工作",
+        location: "家",
+        physicalState: { outfit: "红色礼服", heldItems: ["平板电脑"] },
+      },
+      { start: "12:00", end: "24:00", kind: "rest", activity: "休息", location: "家" },
+    ],
+  });
+  const work = entries.find((entry) => entry.activity === "工作");
+  assert.equal(work.physicalState, undefined);
+  assert.equal(work.outfit, undefined);
+  assert.equal(work.heldItems, undefined);
+});
+
+test("runtime state inherits physical facts and records explicit clears", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        {
+          start: "00:00",
+          end: "08:00",
+          kind: "rest",
+          activity: "在家休息",
+          location: "家",
+          physicalState: {
+            outfit: "灰色家居服",
+            carriedItems: ["钥匙"],
+            heldItems: ["手机"],
+            internalDevices: ["左耳人工耳蜗"],
+            bodyState: "精神正常",
+            limbStates: { leftArm: "自然下垂", rightHand: "握着手机" },
+          },
+        },
+        {
+          start: "08:00",
+          end: "10:00",
+          kind: "work",
+          activity: "专注工作",
+          location: "家",
+          physicalState: {
+            bodyState: "专注",
+            limbStates: { rightHand: "敲键盘" },
+          },
+        },
+        {
+          start: "10:00",
+          end: "12:00",
+          kind: "prepare",
+          activity: "放下手中物品",
+          location: "家",
+          physicalState: {
+            heldItems: [],
+            carriedItems: [],
+            limbStates: { rightHand: null },
+          },
+        },
+        { start: "12:00", end: "24:00", kind: "rest", activity: "休息", location: "家" },
+      ],
+    }),
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 41, userId: 42 };
+  const morning = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T09:00:00.000Z"),
+  });
+  assert.equal(morning.runtimeState.outfit, "灰色家居服");
+  assert.deepEqual(morning.runtimeState.physicalState.heldItems, ["手机"]);
+  assert.deepEqual(morning.runtimeState.physicalState.internalDevices, ["左耳人工耳蜗"]);
+  assert.equal(morning.runtimeState.physicalState.bodyState, "专注");
+  assert.equal(morning.runtimeState.physicalState.limbStates.leftArm, "自然下垂");
+  assert.equal(morning.runtimeState.physicalState.limbStates.rightHand, "敲键盘");
+
+  const prepared = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T10:30:00.000Z"),
+  });
+  assert.deepEqual(prepared.runtimeState.physicalState.heldItems, []);
+  assert.deepEqual(prepared.runtimeState.physicalState.carriedItems, []);
+  assert.deepEqual(prepared.runtimeState.physicalState.internalDevices, ["左耳人工耳蜗"]);
+  assert.equal(prepared.runtimeState.physicalState.limbStates.rightHand, undefined);
+  assert.equal(prepared.runtimeState.physicalState.limbStates.leftArm, "自然下垂");
+  assert.deepEqual(prepared.runtimeState.physicalStateChanges.heldItems.to, []);
+  assert.deepEqual(prepared.runtimeState.physicalStateChanges.carriedItems.to, []);
+  assert.match(manager.buildRuntimeContextFromState(prepared), /当前手持物品：双手空着/);
+});
+
+test("explicit physical state updates persist into later schedule entries", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        {
+          start: "00:00",
+          end: "12:00",
+          kind: "rest",
+          activity: "在家休息",
+          location: "家",
+          physicalState: { outfit: "家居服", heldItems: ["手机"] },
+        },
+        { start: "12:00", end: "24:00", kind: "rest", activity: "继续休息", location: "家" },
+      ],
+    }),
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 51, userId: 52 };
+  const at = new Date("2026-08-04T09:00:00.000Z");
+  await manager.getState(role.name, { scope, at });
+  const updated = await manager.updatePhysicalState(
+    role.name,
+    scope,
+    { outfit: "黑色外出服", heldItems: [] },
+    { at, reason: "角色换上外出服并放下手机" },
+  );
+  assert.equal(updated.ok, true);
+  assert.equal(updated.physicalState.outfit, "黑色外出服");
+  assert.deepEqual(updated.physicalState.heldItems, []);
+
+  const later = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T13:00:00.000Z"),
+  });
+  assert.equal(later.runtimeState.outfit, "黑色外出服");
+  assert.deepEqual(later.runtimeState.physicalState.heldItems, []);
+  const otherUser = await manager.getState(role.name, {
+    scope: { chatId: 53, userId: 54 },
+    at,
+  });
+  assert.equal(otherUser.runtimeState.outfit, "家居服");
+  assert.deepEqual(otherUser.runtimeState.physicalState.heldItems, ["手机"]);
+  assert.equal(
+    (await db.findAsync({ type: ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE })).length,
+    1,
+  );
+});
+
+test("internal device updates carry forward to the next day", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "12:00", kind: "rest", activity: "休息", location: "家" },
+        { start: "12:00", end: "24:00", kind: "rest", activity: "继续休息", location: "家" },
+      ],
+    }),
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 61, userId: 62 };
+  const dayOne = new Date("2026-08-04T09:00:00.000Z");
+  await manager.getState(role.name, { scope, at: dayOne });
+  await manager.updatePhysicalState(
+    role.name,
+    scope,
+    { internalDevices: ["义眼"] },
+    { at: dayOne, reason: "安装义眼" },
+  );
+
+  const nextDay = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-05T09:00:00.000Z"),
+  });
+  assert.deepEqual(nextDay.runtimeState.physicalState.internalDevices, ["义眼"]);
 });
 
 test("generates one daily schedule, reports current state, and honors caffeine", async () => {
@@ -340,10 +691,10 @@ test("only sends proactive messages during idle entries and applies cooldown", a
     getRoles: async () => [role],
     timezone: "UTC",
     generateSchedule: async () => ({
-      entries: [
-        { start: "00:00", end: "12:00", kind: "work", activity: "工作", location: "工作室" },
-        { start: "12:00", end: "13:00", kind: "meal", activity: "吃饭", location: "工作室" },
-        { start: "13:00", end: "24:00", kind: "work", activity: "工作", location: "工作室" },
+        entries: [
+          { start: "00:00", end: "12:00", kind: "work", activity: "工作", location: "工作室" },
+          { start: "12:00", end: "14:00", kind: "meal", activity: "吃饭", location: "工作室" },
+          { start: "14:00", end: "24:00", kind: "work", activity: "工作", location: "工作室" },
       ],
     }),
     proactiveProbability: 1,
@@ -359,9 +710,121 @@ test("only sends proactive messages during idle entries and applies cooldown", a
 
   const first = await manager.maybeSendProactive(session, at);
   const second = await manager.maybeSendProactive(session, at);
+  const afterCooldown = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T13:20:00.000Z"),
+  );
   assert.equal(first.sent, true);
   assert.equal(second.sent, false);
+  assert.equal(afterCooldown.sent, false);
   assert.deepEqual(sent, ["吃饭"]);
+});
+
+test("honors proactive false and ignores filler rest entries", () => {
+  const entries = normalizeScheduleEntries({
+    entries: [
+      { start: "00:00", end: "08:00", kind: "sleep", activity: "睡觉", location: "家" },
+      { start: "08:00", end: "12:00", kind: "rest", activity: "安静休息", location: "家", proactive: false },
+      { start: "12:00", end: "13:00", kind: "meal", activity: "吃饭", location: "家", proactive: true },
+      { start: "13:00", end: "24:00", kind: "rest", activity: "继续休息", location: "家", proactive: false },
+    ],
+  });
+
+  assert.equal(isIdleEntry(entries.find((entry) => entry.activity === "安静休息")), false);
+  assert.equal(isIdleEntry(entries.find((entry) => entry.activity === "吃饭")), true);
+  assert.equal(isIdleEntry(entries.find((entry) => entry.activity === "继续休息")), false);
+});
+
+test("does not treat explicit pre-sleep rest as actual sleep", () => {
+  assert.equal(isSleepEntry({ kind: "rest", activity: "安静休息，慢慢准备睡觉" }), false);
+  assert.equal(isSleepEntry({ kind: "sleep", activity: "准备睡觉并进入睡眠" }), true);
+  assert.equal(isSleepEntry({ kind: "routine", activity: "准备睡觉" }), true);
+});
+
+test("coalesces concurrent proactive sends for the same schedule entry", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const sent = [];
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  let releaseSend;
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const sendFinished = new Promise((resolve) => {
+    releaseSend = resolve;
+  });
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "12:00", kind: "work", activity: "工作", location: "工作室" },
+        { start: "12:00", end: "14:00", kind: "meal", activity: "吃饭", location: "工作室" },
+        { start: "14:00", end: "24:00", kind: "work", activity: "工作", location: "工作室" },
+      ],
+    }),
+    proactiveProbability: 1,
+    proactiveCooldownMs: 0,
+    random: () => 0,
+    sendProactive: async () => {
+      sent.push("吃饭");
+      markStarted();
+      await sendFinished;
+    },
+    logger: { warn() {} },
+  });
+  const session = { type: "chat-session", chatId: 101, userId: 102, roleName: role.name };
+  const firstPromise = manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:20:00.000Z"),
+  );
+  await started;
+  const second = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:21:00.000Z"),
+  );
+  releaseSend();
+  const first = await firstPromise;
+
+  assert.equal(first.sent, true);
+  assert.equal(second.sent, false);
+  assert.equal(second.reason, "in-flight");
+  assert.deepEqual(sent, ["吃饭"]);
+});
+
+test("does not rewind a role into a blocked transition after a later state was persisted", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "08:00", kind: "sleep", activity: "睡觉", location: "家" },
+        { start: "08:00", end: "08:20", kind: "commute", activity: "前往办公室", location: "家", destination: "办公室" },
+        { start: "08:20", end: "12:00", kind: "work", activity: "工作", location: "办公室" },
+        { start: "12:00", end: "24:00", kind: "rest", activity: "休息", location: "办公室" },
+      ],
+    }),
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 81, userId: 82 };
+
+  const later = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T09:00:00.000Z"),
+  });
+  const earlier = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T07:00:00.000Z"),
+  });
+
+  assert.equal(later.runtimeState.location, "办公室");
+  assert.equal(earlier.runtimeState.status, "stable");
+  assert.equal(earlier.runtimeState.location, "家");
+  assert.notEqual(earlier.runtimeState.status, "blocked_transition");
 });
 
 test("rolls behavior execution, completion, failure, and one retry destination", async () => {
