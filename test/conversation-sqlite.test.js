@@ -72,6 +72,47 @@ test("processes a role conversation through SQLite and persists the assistant re
       .join("\n");
     assert.match(convertedLatestUser, /主卧工作角/);
     assert.match(convertedLatestUser, /喵/);
+
+    const toolResultBlocks = [{
+      type: "tool_result",
+      tool_use_id: "call_runtime_state_test",
+      content: '{"ok":true}',
+    }];
+    const modelMessagesWithToolResult = app.buildModelMessages(
+      [
+        { role: "system", content: "你是一个长期陪伴用户的角色。" },
+        { role: "user", content: "现在几点？" },
+        {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "call_runtime_state_test",
+            name: "get_current_time",
+            input: {},
+          }],
+        },
+        { role: "user", content: toolResultBlocks },
+      ],
+      {
+        role: "system",
+        content: "角色日程运行时状态：当前地点：主卧；当前活动：休息。",
+      },
+    );
+    const originalUserMessage = modelMessagesWithToolResult.find(
+      (message) => message.role === "user" && typeof message.content === "string",
+    );
+    assert.match(originalUserMessage.content, /系统附带：本轮实时角色状态/);
+    assert.match(originalUserMessage.content, /现在几点/);
+    assert.deepEqual(modelMessagesWithToolResult.at(-1), {
+      role: "user",
+      content: toolResultBlocks,
+    });
+    const convertedToolResultSequence = convertMessages(modelMessagesWithToolResult);
+    assert.deepEqual(convertedToolResultSequence.messages.at(-1), {
+      role: "user",
+      content: toolResultBlocks,
+    });
+
     assert.equal(app.parseExplicitRuntimeLocationUpdate("（瞬移到家里）"), "家里");
     assert.equal(app.parseExplicitRuntimeLocationUpdate("请让她瞬移到家里"), "");
     const contextHistory = app.getSessionMessagesForModel({
@@ -90,6 +131,35 @@ test("processes a role conversation through SQLite and persists the assistant re
     assert.deepEqual(
       contextHistory.map((message) => message.content),
       ["稳定人设", "旧的电影院场景", "新的普通聊天"],
+    );
+    const truncatedToolResultHistory = app.getSessionMessagesForModel({
+      modelContextStartIndex: 3,
+      messages: [
+        { role: "system", content: "稳定人设" },
+        { role: "user", content: "之前的提问" },
+        {
+          role: "assistant",
+          content: [{
+            type: "tool_use",
+            id: "call_truncated_test",
+            name: "get_current_time",
+            input: {},
+          }],
+        },
+        {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: "call_truncated_test",
+            content: '{"ok":true}',
+          }],
+        },
+        { role: "assistant", content: "现在是测试时间。" },
+      ],
+    });
+    assert.deepEqual(
+      truncatedToolResultHistory.map((message) => message.role),
+      ["system", "assistant"],
     );
 
     await app.db.ready;

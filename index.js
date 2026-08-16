@@ -2050,6 +2050,16 @@ async function getRoleScheduleRuntimeContext(ctx) {
   }
 }
 
+function hasAnthropicToolResultBlock(messageRecord) {
+  return messageRecord?.role === "user"
+    && Array.isArray(messageRecord.content)
+    && messageRecord.content.some((part) => part?.type === "tool_result");
+}
+
+function isToolResultConversationMessage(messageRecord) {
+  return messageRecord?.role === "tool" || hasAnthropicToolResultBlock(messageRecord);
+}
+
 function buildModelMessages(messages, runtimeContext = null) {
   const toolInstruction = {
     role: "system",
@@ -2078,7 +2088,7 @@ function buildModelMessages(messages, runtimeContext = null) {
     content: [
       ...existingSystemMessages,
       toolInstruction.content,
-      "每轮请求都会由服务器在最新用户消息的开头附带一段临时实时状态；带有“系统附带”标签的内容优先于历史会话中的冲突叙事，且不会写入会话历史。",
+      "每轮请求都会由服务器在最新的普通用户消息开头附带一段临时实时状态；带有“系统附带”标签的内容优先于历史会话中的冲突叙事，且不会写入会话历史。",
     ].filter(Boolean).join("\n\n"),
   };
   const modelMessages = [systemMessage, ...conversationMessages];
@@ -2089,9 +2099,11 @@ function buildModelMessages(messages, runtimeContext = null) {
   // MiniMax's Anthropic adapter merges every system message into one global
   // prompt, so a temporary system anchor is no longer near the current turn.
   // Keep the stable system prefix cacheable and prepend the changing state to
-  // the final user turn instead; it remains ordered correctly for both APIs.
+  // the final ordinary user turn instead. Anthropic tool-result messages also
+  // use the user role, but must remain an exact response to the preceding
+  // tool_use block; adding text to them breaks MiniMax's tool-call matching.
   const latestUserIndex = modelMessages.findLastIndex(
-    (messageRecord) => messageRecord?.role === "user",
+    (messageRecord) => messageRecord?.role === "user" && !hasAnthropicToolResultBlock(messageRecord),
   );
   const runtimePrefix = [
     "【系统附带：本轮实时角色状态（只对本轮回复生效，不写入会话历史）】",
@@ -2099,6 +2111,11 @@ function buildModelMessages(messages, runtimeContext = null) {
     "【以下才是用户本轮消息】",
   ].join("\n");
   if (latestUserIndex < 0) {
+    // Never append a synthetic user message after a tool result. The result
+    // must immediately follow the assistant's tool_use message.
+    if (modelMessages.some(isToolResultConversationMessage)) {
+      return modelMessages;
+    }
     return [...modelMessages, { role: "user", content: runtimePrefix }];
   }
   const latestUserMessage = modelMessages[latestUserIndex];
@@ -6472,8 +6489,9 @@ function getSessionMessagesForModel(session) {
     conversation = conversation.slice(-MODEL_CONVERSATION_MESSAGE_LIMIT);
   }
   // A truncated context must never start with a tool result whose associated
-  // assistant tool call has already been left out of the prompt.
-  while (conversation[0]?.role === "tool") {
+  // assistant tool call has already been left out of the prompt. OpenAI uses
+  // role="tool" while Anthropic/MiniMax represents results as role="user".
+  while (isToolResultConversationMessage(conversation[0])) {
     conversation = conversation.slice(1);
   }
   return [...systemMessages, ...conversation];
