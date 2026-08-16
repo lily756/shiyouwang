@@ -355,11 +355,11 @@ const TOOL_USE_SYSTEM_PROMPT = [
   "当用户需要准确的当前时间时，必须调用 get_current_time，不能凭记忆猜测。",
   "除非用户明确表示不要图片，当当前角色刚换装、来到漂亮或有故事感的场景、发生自然的自拍/打卡/纪念瞬间，或对话中出现其他确实值得用一张照片记录的具体画面时，主动调用 generate_character_image，把照片直接发给用户。普通寒暄、知识问答或只有一个形容词不要滥用图片；只有用户明确要求多张不同画面时才调用两次图片工具。",
   "当用户一次提出多个独立媒体结果（例如两张图片、图片加视频、图片加语音）时，必须在同一轮发出多个对应的媒体工具调用，不要只完成其中一件。每个工具调用都要有自己的 prompt/text、reply 和必要的 caption；图片最多两张，图片/视频/音频媒体任务合计最多四个。",
-  "调用媒体 Function 时必须同时提供 reply 和 prompt/instruction。prompt/instruction 是交给图片提示词编排器或视频 provider 的媒体意图；图片后台任务会结合当前角色 system prompt 与最近对话再优化一次。reply 是立即发送给用户的角色口吻回复，应该结合本轮上下文、自然俏皮，说明已经开始准备但不要假称成品完成；caption 是可选的成品配文，progress_message 仅为旧调用兼容。所有这些文案只用于消息展示，不要混入媒体 prompt。",
+  "调用媒体 Function 时必须同时提供 reply 和 prompt/instruction。prompt/instruction 是交给图片提示词编排器或视频 provider 的媒体意图；图片后台任务会结合当前角色 system prompt 与最近对话再优化一次。角色运行时 state 只用于对话和服务器侧连续性校验，绝不能把 state 的字段、状态锁、地点、穿着、物品、身体或四肢描述机械复制、拼接或概括到 generate_character_image / edit_reference_image 的 prompt/instruction 中；图片 prompt 只写用户明确要求的画面意图。reply 是立即发送给用户的角色口吻回复，应该结合本轮上下文、自然俏皮，说明已经开始准备但不要假称成品完成；caption 是可选的成品配文，progress_message 仅为旧调用兼容。所有这些文案只用于消息展示，不要混入媒体 prompt。",
   "图片和视频均采用后台任务。工具结果标记 imageQueued、videoQueued 或 videoPipelineQueued 时，只能说明已开始处理、成品会稍后主动发送；绝不能假称图片或视频已经生成、已经发送，或重复 progress_message。",
   VIDEO_LOCATION_GUARD_ENABLED
-    ? "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，它们是角色此刻的连续性事实。回复、自拍、图片和视频必须延续这些事实；不要因为用户刚提到另一个场景就让角色瞬间移动、换装或凭空改变道具。用户明确要求未来场景时，应先说明需要准备和移动，除非当前日程状态已经到达，否则不要直接生成那个未来场景。"
-    : "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，普通回复和图片仍应尽量保持连续；但视频地点状态校验已关闭，用户明确要求的视频地点和场景优先，不因当前地点、移动状态或日程同步异常拒绝视频工具。",
+    ? "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，它们是角色此刻的连续性事实。普通回复和视频必须延续这些事实；不要因为用户刚提到另一个场景就让角色瞬间移动、换装或凭空改变道具。图片 Function 的 prompt/instruction 不得自动带入这些 state 字段；必要的移动状态由服务器单独校验。用户明确要求未来场景时，应先说明需要准备和移动，除非当前日程状态已经到达，否则不要直接生成那个未来场景。"
+    : "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，普通回复仍应尽量保持连续；图片 Function 的 prompt/instruction 不得自动带入这些 state 字段。视频地点状态校验已关闭，用户明确要求的视频地点和场景优先，不因当前地点、移动状态或日程同步异常拒绝视频工具。",
   "如果用户明确说角色已经换衣、拿起或放下物品、安装或移除身体内部装置，或身体/四肢状态已经发生变化，先调用 update_role_physical_state 记录现实变化，再继续回复或生成媒体；如果用户明确说角色已经到达、回到、来到、移动到某个地点，或当前正在做什么/处于什么环境已经改变，先调用 update_role_runtime_state 记录实际地点和场景。若同一轮还要生成图片/视频，所有状态更新必须先于媒体工具。用户只是提出想象中的未来画面、写作设定或媒体 prompt 时，不要把它当成现实状态更新。",
   "当用户明确要求角色用声音朗读、说出来、发语音或试听角色声音时，调用 generate_character_audio；工具结果标记 audioQueued 后只说明正在准备音频，完成后会单独发送，不能假称音频已生成。若运行时 ASMR/助眠语音模式已开启，不要手动传普通 voice_id，让工具自动使用当前角色的 ASMR 音色；语气和 text 也要更轻、更慢、更适合睡前聆听。",
   MEDIA_PROMPT_MODE === "guided"
@@ -1994,6 +1994,54 @@ function bindRoleStateToMediaPrompt(prompt, runtimeState, options = {}) {
     .join("\n");
 }
 
+function stripInjectedRoleStateFromImagePrompt(value) {
+  const prompt = typeof value === "string" ? value.trim() : "";
+  const runtimeStateStart = prompt.indexOf("【系统附带：本轮实时角色状态（只对本轮回复生效，不写入会话历史）】");
+  const userMessageMarker = "【以下才是用户本轮消息】";
+  if (runtimeStateStart >= 0) {
+    const userMessageStart = prompt.indexOf(userMessageMarker, runtimeStateStart);
+    if (userMessageStart >= 0) {
+      return prompt.slice(userMessageStart + userMessageMarker.length).trim();
+    }
+    return prompt.slice(0, runtimeStateStart).trim();
+  }
+  const stateHeader = "角色连续性状态锁（必须遵守）：";
+  const stateStart = prompt.indexOf(stateHeader);
+  if (stateStart < 0) {
+    return prompt;
+  }
+  const intentMarkers = [
+    "原始媒体意图（不得覆盖上述当前状态）：",
+    "用户明确的视频意图（优先按用户要求执行）：",
+  ];
+  for (const marker of intentMarkers) {
+    const markerIndex = prompt.indexOf(marker, stateStart + stateHeader.length);
+    if (markerIndex >= 0) {
+      return prompt.slice(markerIndex + marker.length).trim();
+    }
+  }
+  // A malformed legacy state envelope is safer to reject than to forward to
+  // an image provider. Any usable user intent before the state block remains.
+  return prompt.slice(0, stateStart).trim();
+}
+
+function stripInjectedRoleStateFromImageContext(value) {
+  const context = typeof value === "string" ? value.trim() : "";
+  const runtimeStateHeader = "【系统附带：本轮实时角色状态（只对本轮回复生效，不写入会话历史）】";
+  const userMessageMarker = "【以下才是用户本轮消息】";
+  const runtimeStateStart = context.indexOf(runtimeStateHeader);
+  if (runtimeStateStart >= 0) {
+    const userMessageStart = context.indexOf(userMessageMarker, runtimeStateStart);
+    const beforeState = context.slice(0, runtimeStateStart).trim();
+    const afterState = userMessageStart >= 0
+      ? context.slice(userMessageStart + userMessageMarker.length).trim()
+      : "";
+    return [beforeState, afterState].filter(Boolean).join("\n").trim();
+  }
+  const stateStart = context.indexOf("角色连续性状态锁（必须遵守）：");
+  return stateStart >= 0 ? context.slice(0, stateStart).trim() : context;
+}
+
 async function getRoleRuntimeStateForMedia(roleName, scope) {
   if (!ROLE_SCHEDULE_ENABLED || !roleName || !scope) {
     return null;
@@ -2063,8 +2111,6 @@ async function sendProactiveRoleUpdate({ role, session, state }) {
         "不要生成任何文字、Logo 或水印。",
       ].join("\n");
       const roleStateSnapshot = normalizeRoleStateSnapshot(state.runtimeState);
-      const continuityPrompt = buildRoleStateContinuityPrompt(roleStateSnapshot);
-      const boundImagePrompt = bindRoleStateToMediaPrompt(imagePrompt, roleStateSnapshot);
       const caption = buildFallbackRoleProactiveMessage({ state });
       const taskRecord = await db.insertAsync({
         type: "image-generation-task",
@@ -2072,16 +2118,13 @@ async function sendProactiveRoleUpdate({ role, session, state }) {
         userId: scope.userId,
         chatId: scope.chatId,
         roleName: role.name,
-        prompt: boundImagePrompt,
+        prompt: imagePrompt,
         originalPrompt: imagePrompt,
         aspectRatio: "",
         caption: normalizeImageCaption(caption),
         includeCurrentRole,
         saveAsRoleReference: false,
-        promptContext: [
-          `角色日程：${activity}；环境：${environment}；这是角色主动分享的生活照片。`,
-          continuityPrompt,
-        ].filter(Boolean).join("\n"),
+        promptContext: "这是角色主动分享的生活照片。",
         roleStateSnapshot,
         promptModel: getRoleScheduleModelName(),
         status: "queued",
@@ -2572,7 +2615,7 @@ async function requestNewApiCharacterImage(
     };
   }
 
-  const normalizedPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  const normalizedPrompt = stripInjectedRoleStateFromImagePrompt(prompt);
   if (!normalizedPrompt || normalizedPrompt.length > 4_000) {
     return {
       ok: false,
@@ -2614,7 +2657,9 @@ async function requestNewApiCharacterImage(
 
   try {
     let result = await sendRequest(normalizedPrompt);
-    const safeFallbackPrompt = buildNewApiSafeImageFallbackPrompt(fallbackPrompt);
+    const safeFallbackPrompt = buildNewApiSafeImageFallbackPrompt(
+      stripInjectedRoleStateFromImagePrompt(fallbackPrompt),
+    );
     if (
       !result.response.ok
       && isNewApiGptImage2Model(NEWAPI_IMAGE_MODEL)
@@ -2668,7 +2713,7 @@ async function requestSeedreamImage({ prompt, referenceImages = [], aspectRatio 
     };
   }
 
-  const normalizedPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  const normalizedPrompt = stripInjectedRoleStateFromImagePrompt(prompt);
   if (!normalizedPrompt || normalizedPrompt.length > 20_000) {
     return { ok: false, error: "图片提示词不能为空且不能超过 20000 个字符。" };
   }
@@ -2777,18 +2822,19 @@ async function requestSeedreamImage({ prompt, referenceImages = [], aspectRatio 
 }
 
 function buildRoleReferenceImagePrompt({ prompt, roleName, maxLength = 0 }) {
+  const normalizedPrompt = stripInjectedRoleStateFromImagePrompt(prompt);
   if (MEDIA_PROMPT_MODE === "freeform") {
     return buildRoleReferenceImagePromptForMode({
-      prompt,
+      prompt: normalizedPrompt,
       roleName,
       mode: MEDIA_PROMPT_MODE,
       maxLength,
     });
   }
-  const normalizedPrompt = typeof prompt === "string" ? prompt.replace(/\s+/g, " ").trim() : "";
+  const normalizedInlinePrompt = normalizedPrompt.replace(/\s+/g, " ").trim();
   const name = typeof roleName === "string" ? roleName.trim().slice(0, 64) : "当前角色";
   const result = [
-    `生成一张全新的角色画面，画面要求：${normalizedPrompt}`,
+    `生成一张全新的角色画面，画面要求：${normalizedInlinePrompt}`,
     `以输入的人设图作为「${name}」的身份与视觉风格参考，严格保持面部、发型、体态、主配色以及参考图本身的原生媒介、线条、材质、光影和渲染方式。不要将真人照片擅自改成动漫/插画，也不要将插画、3D 或其他风格擅自改成写实照片。`,
     "可按画面要求改变服装、姿势、镜头和场景，不要复制参考图的构图；不要生成文字、水印或 Logo。",
   ].join("\n");
@@ -2809,13 +2855,15 @@ async function requestCharacterImage(
   prompt,
   { roleReference = null, aspectRatio = "", fallbackPrompt = "" } = {},
 ) {
+  const safePrompt = stripInjectedRoleStateFromImagePrompt(prompt);
+  const safeFallbackPrompt = stripInjectedRoleStateFromImagePrompt(fallbackPrompt);
   if (!roleReference?.ok) {
     if (getActiveImageProvider() === "minimax") {
-      return minimaxProvider.generateImage({ prompt, aspectRatio });
+      return minimaxProvider.generateImage({ prompt: safePrompt, aspectRatio });
     }
     return getActiveImageProvider() === "seedream"
-      ? requestSeedreamImage({ prompt, aspectRatio })
-      : requestNewApiCharacterImage(prompt, { aspectRatio, fallbackPrompt });
+      ? requestSeedreamImage({ prompt: safePrompt, aspectRatio })
+      : requestNewApiCharacterImage(safePrompt, { aspectRatio, fallbackPrompt: safeFallbackPrompt });
   }
 
   if (getActiveImageProvider() === "minimax") {
@@ -2825,7 +2873,7 @@ async function requestCharacterImage(
     }
     return minimaxProvider.generateImage({
       prompt: buildRoleReferenceImagePrompt({
-        prompt,
+        prompt: safePrompt,
         roleName: roleReference.roleName,
       }),
       referenceImages: [referenceDataUrl],
@@ -2839,7 +2887,7 @@ async function requestCharacterImage(
       return { ok: false, error: "角色人设图无效，无法作为图片参考图。" };
     }
     return requestSeedreamImage({
-      prompt: buildRoleReferenceImagePrompt({ prompt, roleName: roleReference.roleName }),
+      prompt: buildRoleReferenceImagePrompt({ prompt: safePrompt, roleName: roleReference.roleName }),
       referenceImages: [referenceDataUrl],
       aspectRatio,
     });
@@ -2849,7 +2897,7 @@ async function requestCharacterImage(
     referenceImage: roleReference.image,
     mimeType: roleReference.mimeType,
     instruction: buildRoleReferenceImagePrompt({
-      prompt,
+      prompt: safePrompt,
       roleName: roleReference.roleName,
       maxLength: 620,
     }),
@@ -2938,9 +2986,10 @@ function buildReferenceImageEditPrompt({
   roleName,
   roleReferenceAttached = false,
 }) {
+  const normalizedInstruction = stripInjectedRoleStateFromImagePrompt(instruction);
   if (MEDIA_PROMPT_MODE === "freeform") {
     return buildReferenceImageEditPromptForMode({
-      instruction,
+      instruction: normalizedInstruction,
       editType,
       roleName,
       roleReferenceAttached,
@@ -2949,7 +2998,6 @@ function buildReferenceImageEditPrompt({
   }
   const normalizedType = normalizeImageEditType(editType);
   const activeRole = typeof roleName === "string" ? roleName.trim().slice(0, 64) : "";
-  const normalizedInstruction = typeof instruction === "string" ? instruction.trim() : "";
   const typeInstructions = {
     outfit: [
       "编辑类型：角色换装。",
@@ -3190,12 +3238,16 @@ async function requestMiniMaxReferenceImageEdit({
 }
 
 async function requestReferenceImageEdit(input) {
+  const safeInput = {
+    ...input,
+    instruction: stripInjectedRoleStateFromImagePrompt(input?.instruction),
+  };
   if (getActiveImageProvider() === "minimax") {
-    return requestMiniMaxReferenceImageEdit(input);
+    return requestMiniMaxReferenceImageEdit(safeInput);
   }
   return getActiveImageProvider() === "seedream"
-    ? requestSeedreamReferenceImageEdit(input)
-    : requestNewApiReferenceImageEdit(input);
+    ? requestSeedreamReferenceImageEdit(safeInput)
+    : requestNewApiReferenceImageEdit(safeInput);
 }
 
 function normalizeRoleReferenceMimeType(value) {
@@ -3777,13 +3829,7 @@ async function queueVideoProductionAsset({ pipeline, asset }) {
   if (!pipeline?.chatId || !pipeline?.userId || !pipeline?.roleName || !asset?.id) {
     throw new Error("视频素材任务缺少对话、角色或素材信息。");
   }
-  const continuityPrompt = buildRoleStateContinuityPrompt(pipeline.roleStateSnapshot, {
-    enforceLocationGuard: VIDEO_LOCATION_GUARD_ENABLED,
-  });
   const originalPrompt = String(asset.prompt || "").trim();
-  const boundPrompt = bindRoleStateToMediaPrompt(originalPrompt, pipeline.roleStateSnapshot, {
-    enforceLocationGuard: VIDEO_LOCATION_GUARD_ENABLED,
-  });
   const task = await db.insertAsync({
     type: "image-generation-task",
     kind: "generate",
@@ -3793,7 +3839,7 @@ async function queueVideoProductionAsset({ pipeline, asset }) {
     userId: pipeline.userId,
     chatId: pipeline.chatId,
     roleName: pipeline.roleName,
-    prompt: boundPrompt,
+    prompt: originalPrompt,
     originalPrompt,
     aspectRatio: normalizeImageAspectRatio(getVideoProductionImageAspectRatio(pipeline.ratio)),
     caption: `视频素材：${asset.name}`,
@@ -3806,7 +3852,6 @@ async function queueVideoProductionAsset({ pipeline, asset }) {
       `素材类型：${asset.kind}；素材名称：${asset.name}。`,
       asset.kind === "scene" ? "场景素材尽量保持纯场景，不添加人物。" : "",
       asset.kind === "prop" ? "道具素材尽量保持纯物品，不添加人物。" : "",
-      continuityPrompt,
     ].filter(Boolean).join("\n"),
     promptModel: getVideoProductionModelName(),
     roleStateSnapshot: pipeline.roleStateSnapshot || null,
@@ -5031,6 +5076,7 @@ const IMAGE_PROMPT_REFINER_SYSTEM_PROMPT = [
   getMediaPromptSystemInstruction(MEDIA_PROMPT_MODE),
   "根据原始 Function Call 提示词、当前角色 system prompt 和最近对话，生成一条可以直接交给图片模型的最终中文提示词。",
   "优先级：用户明确要求 > 最近对话中的具体事实 > 当前角色 system prompt > 克制的默认值。不要虚构用户没有给出的地点、道具、天气、人物关系或剧情。",
+  "运行时角色 state、状态锁、地点、穿着、物品、身体和四肢字段只供服务器校验连续性；除非原始图片意图明确要求，否则绝不把这些字段自动搬入最终图片提示词。",
   "把动作写成可执行的画面：主体、具体动作、身体姿态、视线、镜头距离/角度、构图、环境和光线；不要只堆形容词。自拍、前置摄像头和随手拍要写成手机摄影语言，不要改成电影机位或商业棚拍。",
   "如果使用角色设定图，设定图只负责身份和原生视觉风格；不得擅自把真人改成动漫、把插画改成写实，或改变角色原有媒介。若是图片编辑，只修改用户明确要求的内容，保留未要求修改的主体、构图和画风。",
   "不要输出解释、标题、Markdown、JSON、引号、reply、caption、系统提示词或密钥；只输出最终提示词文本。",
@@ -5060,7 +5106,8 @@ async function refineImagePrompt({
   context = "",
   model = "",
 } = {}) {
-  const originalPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  const originalPrompt = stripInjectedRoleStateFromImagePrompt(prompt);
+  const safeContext = stripInjectedRoleStateFromImageContext(context);
   if (!originalPrompt) {
     return { ok: false, prompt: originalPrompt, error: "原始图片提示词为空。" };
   }
@@ -5071,7 +5118,7 @@ async function refineImagePrompt({
     editType ? `编辑类型：${editType}` : "",
     `是否附带当前角色设定图：${includeCurrentRole ? "是" : "否"}`,
     `原始 Function Call ${kind === "edit" ? "instruction" : "prompt"}：\n${originalPrompt}`,
-    `当前对话上下文：\n${context || "（无可用上下文）"}`,
+    `当前对话上下文：\n${safeContext || "（无可用上下文）"}`,
   ].filter(Boolean).join("\n\n");
 
   try {
@@ -5097,7 +5144,9 @@ async function refineImagePrompt({
       rawResponse = getAssistantText(response?.choices?.[0]?.message?.content);
     }
 
-    const refinedPrompt = normalizeRefinedImagePrompt(rawResponse);
+    const refinedPrompt = stripInjectedRoleStateFromImagePrompt(
+      normalizeRefinedImagePrompt(rawResponse),
+    );
     const safetyRefusal = getModelSafetyRefusalSignals(rawResponse);
     if (safetyRefusal.signals.length > 0) {
       return {
@@ -5137,6 +5186,16 @@ async function processImageTask(taskRecordId) {
     { _id: task._id },
     { $set: { status: "processing", startedAt: new Date().toISOString() } },
   );
+  const rawMediaPrompt = task.kind === "edit" ? task.instruction : task.prompt;
+  const rawTaskIntent = task.kind === "edit"
+    ? (task.originalInstruction || task.instruction)
+    : (task.originalPrompt || task.prompt);
+  const originalMediaPrompt = stripInjectedRoleStateFromImagePrompt(rawMediaPrompt);
+  const originalTaskIntent = stripInjectedRoleStateFromImagePrompt(rawTaskIntent);
+  const safePromptContext = stripInjectedRoleStateFromImageContext(task.promptContext);
+  const stateWasSanitized = rawMediaPrompt !== originalMediaPrompt
+    || rawTaskIntent !== originalTaskIntent
+    || String(task.promptContext || "") !== safePromptContext;
   await writeGenerationTaskLog("image-task-started", {
     taskId: task._id,
     kind: task.kind,
@@ -5146,17 +5205,35 @@ async function processImageTask(taskRecordId) {
     chatId: task.chatId,
     userId: task.userId,
     roleName: task.roleName,
-    prompt: task.kind === "edit" ? task.instruction : task.prompt,
+    prompt: originalMediaPrompt,
     aspectRatio: task.aspectRatio || null,
     referenceId: task.referenceId || null,
     promptRefinement: IMAGE_PROMPT_REFINEMENT_ENABLED,
+    stateSanitized: stateWasSanitized,
   });
 
   try {
-    const originalMediaPrompt = task.kind === "edit" ? task.instruction : task.prompt;
-    const originalTaskIntent = task.kind === "edit"
-      ? (task.originalInstruction || task.instruction)
-      : (task.originalPrompt || task.prompt);
+    if (!originalMediaPrompt) {
+      throw new Error("图片任务只包含运行时角色 state，缺少可用于生成图片的原始意图。");
+    }
+    if (stateWasSanitized) {
+      await db.updateAsync(
+        { _id: task._id },
+        {
+          $set: task.kind === "edit"
+            ? {
+                instruction: originalMediaPrompt,
+                originalInstruction: originalTaskIntent || originalMediaPrompt,
+                promptContext: safePromptContext,
+              }
+            : {
+                prompt: originalMediaPrompt,
+                originalPrompt: originalTaskIntent || originalMediaPrompt,
+                promptContext: safePromptContext,
+              },
+        },
+      );
+    }
     let mediaPrompt = originalMediaPrompt;
     const promptRefinement = IMAGE_PROMPT_REFINEMENT_ENABLED
       ? await refineImagePrompt({
@@ -5165,7 +5242,7 @@ async function processImageTask(taskRecordId) {
           roleName: task.roleName,
           editType: task.editType,
           includeCurrentRole: task.includeCurrentRole === true,
-          context: task.promptContext,
+          context: safePromptContext,
           model: task.promptModel,
         })
       : { ok: false, prompt: originalMediaPrompt, error: "图片提示词优化已关闭。" };
@@ -5943,21 +6020,19 @@ async function executeToolCall(
     );
     const now = new Date().toISOString();
     const originalPrompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
-    const boundPrompt = bindRoleStateToMediaPrompt(originalPrompt, roleStateSnapshot);
-    const continuityPrompt = buildRoleStateContinuityPrompt(roleStateSnapshot);
     const taskRecord = await db.insertAsync({
       type: "image-generation-task",
       kind: "generate",
       userId: scope.userId,
       chatId: scope.chatId,
       roleName: session.roleName,
-      prompt: boundPrompt,
+      prompt: originalPrompt,
       originalPrompt,
       aspectRatio: normalizeImageAspectRatio(args.aspect_ratio),
       caption: normalizeImageCaption(args.caption),
       includeCurrentRole: args.include_current_role === true,
       saveAsRoleReference: args.save_as_role_reference === true,
-      promptContext: [promptContext, continuityPrompt].filter(Boolean).join("\n"),
+      promptContext,
       promptModel,
       roleStateSnapshot,
       status: "queued",
@@ -5972,7 +6047,7 @@ async function executeToolCall(
       chatId: scope.chatId,
       userId: scope.userId,
       roleName: session.roleName,
-      prompt: boundPrompt,
+      prompt: originalPrompt,
       aspectRatio: normalizeImageAspectRatio(args.aspect_ratio) || null,
       includeCurrentRole: args.include_current_role === true,
       promptModel,
@@ -6132,8 +6207,6 @@ async function executeToolCall(
       };
     }
     const roleStateSnapshot = await getRoleRuntimeStateForMedia(session.roleName, scope);
-    const continuityPrompt = buildRoleStateContinuityPrompt(roleStateSnapshot, { forEdit: true });
-
     const selectedReference = await resolveImageEditReference({
       scope,
       roleName: session.roleName,
@@ -6210,7 +6283,7 @@ async function executeToolCall(
       editType: normalizeImageEditType(args.edit_type),
       caption: normalizeImageCaption(args.caption),
       includeCurrentRole: args.include_current_role === true,
-      promptContext: [promptContext, continuityPrompt].filter(Boolean).join("\n"),
+      promptContext,
       promptModel,
       roleStateSnapshot,
       status: "queued",
@@ -6228,7 +6301,7 @@ async function executeToolCall(
       referenceId: taskReferenceId,
       editType: normalizeImageEditType(args.edit_type),
       includeCurrentRole: args.include_current_role === true,
-      promptContext: [promptContext, continuityPrompt].filter(Boolean).join("\n"),
+      promptContext,
       promptModel,
     });
     scheduleImageTask(taskRecord._id);
@@ -9650,4 +9723,6 @@ module.exports = {
   replaceActiveSession,
   roleStore,
   runModelWithTools,
+  stripInjectedRoleStateFromImageContext,
+  stripInjectedRoleStateFromImagePrompt,
 };

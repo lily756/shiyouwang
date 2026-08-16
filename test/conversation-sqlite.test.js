@@ -86,6 +86,39 @@ test("processes a role conversation through SQLite and persists the assistant re
     assert.match(safeFallbackPrompt, /适合公开展示/);
     assert.match(safeFallbackPrompt, /咖啡馆里读书/);
     assert.doesNotMatch(safeFallbackPrompt, /透明|蕾丝|女仆/);
+    const legacyStateBoundImagePrompt = [
+      "角色连续性状态锁（必须遵守）：",
+      "当前地点：主卧工作角。",
+      "当前实体状态：穿着=透明蕾丝女仆装。",
+      "原始媒体意图（不得覆盖上述当前状态）：",
+      "一位成年人坐在阳光明亮的咖啡馆里读书。",
+    ].join("\n");
+    assert.equal(
+      app.stripInjectedRoleStateFromImagePrompt(legacyStateBoundImagePrompt),
+      "一位成年人坐在阳光明亮的咖啡馆里读书。",
+    );
+    assert.equal(
+      app.stripInjectedRoleStateFromImagePrompt([
+        "【系统附带：本轮实时角色状态（只对本轮回复生效，不写入会话历史）】",
+        "角色日程运行时状态：当前地点：主卧工作角。",
+        "【以下才是用户本轮消息】",
+        "请生成一张在咖啡馆里读书的照片。",
+      ].join("\n")),
+      "请生成一张在咖啡馆里读书的照片。",
+    );
+    assert.equal(
+      app.stripInjectedRoleStateFromImageContext([
+        "system: 你是一个长期陪伴用户的角色。",
+        "【系统附带：本轮实时角色状态（只对本轮回复生效，不写入会话历史）】",
+        "角色日程运行时状态：当前地点：主卧工作角。",
+        "【以下才是用户本轮消息】",
+        "user: 请生成一张在咖啡馆里读书的照片。",
+      ].join("\n")),
+      [
+        "system: 你是一个长期陪伴用户的角色。",
+        "user: 请生成一张在咖啡馆里读书的照片。",
+      ].join("\n"),
+    );
     assert.equal(
       app.isNewApiLikelyContentRejection(400, {
         error: { message: "系统处理信息故障，请重试或者联系客服" },
@@ -128,6 +161,13 @@ test("processes a role conversation through SQLite and persists the assistant re
       assert.equal(newApiRequests[0].response_format, undefined);
       assert.match(newApiRequests[1].prompt, /适合公开展示/);
       assert.doesNotMatch(newApiRequests[1].prompt, /透明|蕾丝|女仆/);
+      const legacyCleanupResult = await app.requestNewApiCharacterImage(
+        legacyStateBoundImagePrompt,
+        { aspectRatio: "3:4" },
+      );
+      assert.deepEqual(legacyCleanupResult, { ok: true, b64Json: "AQ==" });
+      assert.match(newApiRequests[2].prompt, /咖啡馆里读书/);
+      assert.doesNotMatch(newApiRequests[2].prompt, /角色连续性|主卧工作角|透明|蕾丝|女仆/);
     } finally {
       global.fetch = originalFetch;
       console.warn = originalConsoleWarn;
