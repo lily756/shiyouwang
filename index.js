@@ -142,6 +142,15 @@ const NEWAPI_IMAGE_EDIT_MODEL =
   process.env.NEWAPI_IMAGE_EDIT_MODEL || NEWAPI_IMAGE_MODEL;
 const NEWAPI_IMAGE_SIZE = process.env.NEWAPI_IMAGE_SIZE || "1024x1024";
 const NEWAPI_IMAGE_EDIT_SIZE = process.env.NEWAPI_IMAGE_EDIT_SIZE || "1024x1024";
+const NEWAPI_SENSITIVE_VISUAL_TERMS = /(?:裸体|裸露|色情|性(?:爱|交|行为|暗示|器)|自慰|高潮|乳(?:房|头)|胸部|阴(?:茎|道|部)|私密部位|情趣|成人(?:影片|内容)|脱衣|内衣|透明(?:蕾丝|内衣|睡衣)|透视(?:装|内衣)?|蕾丝(?:内衣|女仆装)?|女仆装|床上|nudity|nude|sexual|fetish|lingerie|explicit|erotic)/iu;
+const NEWAPI_ORIGINAL_MEDIA_INTENT_MARKERS = Object.freeze([
+  "原始媒体意图（不得覆盖上述当前状态）：",
+  "用户明确的视频意图（优先按用户要求执行）：",
+]);
+const NEWAPI_SAFE_IMAGE_FALLBACK_PREFIX = [
+  "安全图像要求：此图必须适合公开展示。",
+  "若画面有人物，人物必须明确为成年人且着装完整；不得包含裸体、性暗示、恋物元素、私密部位或露骨内容。",
+].join("\n");
 const IMAGE_ASPECT_RATIOS = Object.freeze(["1:1", "3:4", "4:3", "9:16", "16:9"]);
 const SEEDREAM_API_BASE_URL =
   process.env.SEEDREAM_API_BASE_URL || "https://vvdance.yongmuai.com";
@@ -553,6 +562,49 @@ function getNewApiImageResponseFormat(model) {
   // response_format altogether. Other OpenAI-compatible image models still
   // use the established URL request form.
   return isNewApiGptImage2Model(model) ? "" : "url";
+}
+
+function hasNewApiSensitiveVisualTerms(value) {
+  return NEWAPI_SENSITIVE_VISUAL_TERMS.test(String(value || ""));
+}
+
+function extractNewApiOriginalMediaIntent(prompt) {
+  const normalizedPrompt = String(prompt || "").trim();
+  if (!normalizedPrompt) {
+    return "";
+  }
+  for (const marker of NEWAPI_ORIGINAL_MEDIA_INTENT_MARKERS) {
+    const markerIndex = normalizedPrompt.lastIndexOf(marker);
+    if (markerIndex >= 0) {
+      const intent = normalizedPrompt.slice(markerIndex + marker.length).trim();
+      if (intent) {
+        return intent;
+      }
+    }
+  }
+  return normalizedPrompt;
+}
+
+function buildNewApiSafeImageFallbackPrompt(originalPrompt) {
+  const originalIntent = extractNewApiOriginalMediaIntent(originalPrompt);
+  if (!originalIntent) {
+    return "";
+  }
+  const safeIntent = hasNewApiSensitiveVisualTerms(originalIntent)
+    ? "保留用户原本要求的日常场景、主体和构图，但使用安全、非露骨的表现。"
+    : originalIntent;
+  return [NEWAPI_SAFE_IMAGE_FALLBACK_PREFIX, safeIntent]
+    .join("\n\n")
+    .slice(0, 4_000)
+    .trim();
+}
+
+function isNewApiLikelyContentRejection(status, payload, rawBody) {
+  if (Number(status) !== 400) {
+    return false;
+  }
+  const detail = String(payload?.error?.message || payload?.message || rawBody || "");
+  return /系统处理信息故障|content[ _-]?(?:policy|filter)|safety/iu.test(detail);
 }
 
 function isSeedreamConfigured() {
@@ -2508,7 +2560,10 @@ async function searchWeb(query) {
   }
 }
 
-async function requestNewApiCharacterImage(prompt, { aspectRatio = "" } = {}) {
+async function requestNewApiCharacterImage(
+  prompt,
+  { aspectRatio = "", fallbackPrompt = "" } = {},
+) {
   if (!isNewApiConfigured()) {
     return {
       ok: false,
@@ -2526,8 +2581,9 @@ async function requestNewApiCharacterImage(prompt, { aspectRatio = "" } = {}) {
 
   const endpoint = getNewApiEndpoint("/images/generations");
   const responseFormat = getNewApiImageResponseFormat(NEWAPI_IMAGE_MODEL);
+  const imageSize = getNewApiImageSizeForAspectRatio(aspectRatio);
 
-  try {
+  const sendRequest = async (requestPrompt) => {
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
@@ -2537,8 +2593,8 @@ async function requestNewApiCharacterImage(prompt, { aspectRatio = "" } = {}) {
       },
       body: JSON.stringify({
         model: NEWAPI_IMAGE_MODEL,
-        prompt: normalizedPrompt,
-        size: getNewApiImageSizeForAspectRatio(aspectRatio),
+        prompt: requestPrompt,
+        size: imageSize,
         n: 1,
         ...(responseFormat ? { response_format: responseFormat } : {}),
       }),
@@ -2552,13 +2608,40 @@ async function requestNewApiCharacterImage(prompt, { aspectRatio = "" } = {}) {
     } catch {
       payload = null;
     }
+    return { response, payload, rawBody };
+  };
 
-    if (!response.ok) {
-      const detail = String(payload?.error?.message || rawBody || "未知错误").slice(0, 300);
-      throw new Error(`NewAPI 图片请求失败（HTTP ${response.status}）：${detail}`);
+  try {
+    let result = await sendRequest(normalizedPrompt);
+    const safeFallbackPrompt = buildNewApiSafeImageFallbackPrompt(fallbackPrompt);
+    if (
+      !result.response.ok
+      && isNewApiGptImage2Model(NEWAPI_IMAGE_MODEL)
+      && hasNewApiSensitiveVisualTerms(normalizedPrompt)
+      && safeFallbackPrompt
+      && safeFallbackPrompt !== normalizedPrompt
+      && isNewApiLikelyContentRejection(
+        result.response.status,
+        result.payload,
+        result.rawBody,
+      )
+    ) {
+      console.warn("NewAPI 图片请求疑似触发内容限制，使用安全原始意图重试。", {
+        model: NEWAPI_IMAGE_MODEL,
+        size: imageSize,
+        initialStatus: result.response.status,
+      });
+      result = await sendRequest(safeFallbackPrompt);
     }
 
-    const image = payload?.data?.[0];
+    if (!result.response.ok) {
+      const detail = String(
+        result.payload?.error?.message || result.rawBody || "未知错误",
+      ).slice(0, 300);
+      throw new Error(`NewAPI 图片请求失败（HTTP ${result.response.status}）：${detail}`);
+    }
+
+    const image = result.payload?.data?.[0];
     if (typeof image?.url === "string" && image.url) {
       return { ok: true, url: image.url };
     }
@@ -2723,7 +2806,7 @@ function toImageReferenceDataUrl(referenceImage) {
 
 async function requestCharacterImage(
   prompt,
-  { roleReference = null, aspectRatio = "" } = {},
+  { roleReference = null, aspectRatio = "", fallbackPrompt = "" } = {},
 ) {
   if (!roleReference?.ok) {
     if (getActiveImageProvider() === "minimax") {
@@ -2731,7 +2814,7 @@ async function requestCharacterImage(
     }
     return getActiveImageProvider() === "seedream"
       ? requestSeedreamImage({ prompt, aspectRatio })
-      : requestNewApiCharacterImage(prompt, { aspectRatio });
+      : requestNewApiCharacterImage(prompt, { aspectRatio, fallbackPrompt });
   }
 
   if (getActiveImageProvider() === "minimax") {
@@ -5070,6 +5153,9 @@ async function processImageTask(taskRecordId) {
 
   try {
     const originalMediaPrompt = task.kind === "edit" ? task.instruction : task.prompt;
+    const originalTaskIntent = task.kind === "edit"
+      ? (task.originalInstruction || task.instruction)
+      : (task.originalPrompt || task.prompt);
     let mediaPrompt = originalMediaPrompt;
     const promptRefinement = IMAGE_PROMPT_REFINEMENT_ENABLED
       ? await refineImagePrompt({
@@ -5164,6 +5250,7 @@ async function processImageTask(taskRecordId) {
       image = await requestCharacterImage(mediaPrompt, {
         roleReference,
         aspectRatio: task.aspectRatio,
+        fallbackPrompt: originalTaskIntent,
       });
     }
 
@@ -9382,14 +9469,18 @@ module.exports = {
   executeToolCallsForRound,
   findActiveSession,
   filterCompletedStateUpdateTools,
+  buildNewApiSafeImageFallbackPrompt,
   getNewApiEndpoint,
   getNewApiImageEditSizeForAspectRatio,
   getNewApiImageResponseFormat,
   getNewApiImageSizeForAspectRatio,
   getSessionMessagesForModel,
+  hasNewApiSensitiveVisualTerms,
+  isNewApiLikelyContentRejection,
   normalizeNewApiImageSize,
   parseExplicitRuntimeLocationUpdate,
   processConversationTask,
+  requestNewApiCharacterImage,
   replaceActiveSession,
   roleStore,
   runModelWithTools,

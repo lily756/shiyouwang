@@ -30,6 +30,10 @@ test("processes a role conversation through SQLite and persists the assistant re
     MODEL_PROVIDER: process.env.MODEL_PROVIDER,
     ROLE_SCHEDULE_ENABLED: process.env.ROLE_SCHEDULE_ENABLED,
     MCD_AUTO_LOAD_ENABLED: process.env.MCD_AUTO_LOAD_ENABLED,
+    NEWAPI_BASE_URL: process.env.NEWAPI_BASE_URL,
+    NEWAPI_API_KEY: process.env.NEWAPI_API_KEY,
+    NEWAPI_IMAGE_MODEL: process.env.NEWAPI_IMAGE_MODEL,
+    NEWAPI_IMAGE_SIZE: process.env.NEWAPI_IMAGE_SIZE,
   };
   process.env.SQLITE_DATABASE_FILE = filename;
   process.env.TG_BOT_TOKEN ||= "123456:LOCAL_TEST";
@@ -37,6 +41,10 @@ test("processes a role conversation through SQLite and persists the assistant re
   process.env.MODEL_PROVIDER = "default";
   process.env.ROLE_SCHEDULE_ENABLED = "false";
   process.env.MCD_AUTO_LOAD_ENABLED = "false";
+  process.env.NEWAPI_BASE_URL = "https://example.test";
+  process.env.NEWAPI_API_KEY = "local-newapi-test-key";
+  process.env.NEWAPI_IMAGE_MODEL = "GPT-Image-2";
+  process.env.NEWAPI_IMAGE_SIZE = "1024x1024";
 
   let app = null;
   try {
@@ -68,6 +76,62 @@ test("processes a role conversation through SQLite and persists the assistant re
     );
     assert.equal(app.normalizeNewApiImageSize("1080x1920"), "1024x1792");
     assert.equal(app.normalizeNewApiImageSize("1920x1080"), "1792x1024");
+    assert.equal(app.hasNewApiSensitiveVisualTerms("透明蕾丝女仆装"), true);
+    assert.equal(app.hasNewApiSensitiveVisualTerms("阳光下的普通咖啡馆"), false);
+    const safeFallbackPrompt = app.buildNewApiSafeImageFallbackPrompt([
+      "当前实体状态：穿着=透明蕾丝女仆装。",
+      "原始媒体意图（不得覆盖上述当前状态）：",
+      "一位成年人坐在阳光明亮的咖啡馆里读书。",
+    ].join("\n"));
+    assert.match(safeFallbackPrompt, /适合公开展示/);
+    assert.match(safeFallbackPrompt, /咖啡馆里读书/);
+    assert.doesNotMatch(safeFallbackPrompt, /透明|蕾丝|女仆/);
+    assert.equal(
+      app.isNewApiLikelyContentRejection(400, {
+        error: { message: "系统处理信息故障，请重试或者联系客服" },
+      }, ""),
+      true,
+    );
+    const originalFetch = global.fetch;
+    const originalConsoleWarn = console.warn;
+    const newApiRequests = [];
+    global.fetch = async (_endpoint, options) => {
+      const body = JSON.parse(options.body);
+      newApiRequests.push(body);
+      if (newApiRequests.length === 1) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () => JSON.stringify({
+            error: { message: "系统处理信息故障，请重试或者联系客服" },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ data: [{ b64_json: "AQ==" }] }),
+      };
+    };
+    console.warn = () => undefined;
+    try {
+      const fallbackResult = await app.requestNewApiCharacterImage(
+        "角色穿着透明蕾丝女仆装，坐在咖啡馆里。",
+        {
+          aspectRatio: "3:4",
+          fallbackPrompt: "一位成年人坐在阳光明亮的咖啡馆里读书。",
+        },
+      );
+      assert.deepEqual(fallbackResult, { ok: true, b64Json: "AQ==" });
+      assert.equal(newApiRequests.length, 2);
+      assert.equal(newApiRequests[0].size, "1152x1536");
+      assert.equal(newApiRequests[0].response_format, undefined);
+      assert.match(newApiRequests[1].prompt, /适合公开展示/);
+      assert.doesNotMatch(newApiRequests[1].prompt, /透明|蕾丝|女仆/);
+    } finally {
+      global.fetch = originalFetch;
+      console.warn = originalConsoleWarn;
+    }
     const modelMessages = app.buildModelMessages(
       [
         { role: "system", content: "你是一个长期陪伴用户的角色。" },
