@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const { createSqliteDatabase } = require("../lib/sqlite-database");
+const { convertMessages } = require("../lib/minimax-anthropic");
 
 test("processes a role conversation through SQLite and persists the assistant reply", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "localtest-conversation-sqlite-"));
@@ -54,12 +55,42 @@ test("processes a role conversation through SQLite and persists the assistant re
     assert.equal(modelMessages[0].role, "system");
     assert.doesNotMatch(modelMessages[0].content, /主卧工作角/);
     const latestUserIndex = modelMessages.findLastIndex((message) => message.role === "user");
-    const anchorIndex = modelMessages.findIndex(
-      (message) => message.role === "system" && /本轮临时实时状态/.test(message.content),
+    assert.match(modelMessages[latestUserIndex].content, /系统附带：本轮实时角色状态/);
+    assert.match(modelMessages[latestUserIndex].content, /唯一现实/);
+    assert.match(modelMessages[latestUserIndex].content, /主卧工作角/);
+    assert.match(modelMessages[latestUserIndex].content, /喵/);
+    assert.equal(
+      modelMessages.some((message) => message.role === "system" && /主卧工作角/.test(message.content)),
+      false,
     );
-    assert.ok(anchorIndex > 0 && anchorIndex < latestUserIndex);
-    assert.match(modelMessages[anchorIndex].content, /唯一现实/);
-    assert.match(modelMessages[anchorIndex].content, /主卧工作角/);
+
+    const converted = convertMessages(modelMessages);
+    assert.doesNotMatch(converted.system, /主卧工作角/);
+    const convertedLatestUser = converted.messages.at(-1).content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n");
+    assert.match(convertedLatestUser, /主卧工作角/);
+    assert.match(convertedLatestUser, /喵/);
+    assert.equal(app.parseExplicitRuntimeLocationUpdate("（瞬移到家里）"), "家里");
+    assert.equal(app.parseExplicitRuntimeLocationUpdate("请让她瞬移到家里"), "");
+    const contextHistory = app.getSessionMessagesForModel({
+      modelContextStartIndex: 1,
+      messages: [
+        { role: "system", content: "稳定人设" },
+        { role: "assistant", content: "旧的电影院场景" },
+        {
+          role: "assistant",
+          content: "日程主动消息",
+          metadata: { source: "role-schedule-proactive" },
+        },
+        { role: "user", content: "新的普通聊天" },
+      ],
+    });
+    assert.deepEqual(
+      contextHistory.map((message) => message.content),
+      ["稳定人设", "旧的电影院场景", "新的普通聊天"],
+    );
 
     await app.db.ready;
     const role = (await app.roleStore.getRoles()).find((item) => item.name === "测试角色");

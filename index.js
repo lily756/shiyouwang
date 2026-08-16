@@ -202,6 +202,14 @@ const VIDEO_CURRENT_REFERENCE_ID = "current";
 const VIDEO_TASK_POLL_INTERVAL_MS = 3_000;
 const VIDEO_TASK_TIMEOUT_MS = 10 * 60 * 1_000;
 const CONVERSATION_DEBOUNCE_MS = 1_500;
+const CONVERSATION_TASK_PROCESSING_LEASE_MS = Math.max(
+  60_000,
+  readNumberEnv("CONVERSATION_TASK_PROCESSING_LEASE_MS", 10 * 60 * 1_000),
+);
+const MODEL_CONVERSATION_MESSAGE_LIMIT = Math.max(
+  8,
+  Math.min(120, Math.floor(readNumberEnv("MODEL_CONVERSATION_MESSAGE_LIMIT", 32))),
+);
 const TEXT_MODEL = process.env.OPENAI_MODEL || "";
 const VISION_MODEL = process.env.OPENAI_VISION_MODEL || TEXT_MODEL;
 const ROLE_SCHEDULE_ENABLED = !["false", "0", "no", "off"].includes(
@@ -339,7 +347,7 @@ const TOOL_USE_SYSTEM_PROMPT = [
   VIDEO_LOCATION_GUARD_ENABLED
     ? "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，它们是角色此刻的连续性事实。回复、自拍、图片和视频必须延续这些事实；不要因为用户刚提到另一个场景就让角色瞬间移动、换装或凭空改变道具。用户明确要求未来场景时，应先说明需要准备和移动，除非当前日程状态已经到达，否则不要直接生成那个未来场景。"
     : "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，普通回复和图片仍应尽量保持连续；但视频地点状态校验已关闭，用户明确要求的视频地点和场景优先，不因当前地点、移动状态或日程同步异常拒绝视频工具。",
-  "如果用户明确说角色已经换衣、拿起或放下物品、安装或移除身体内部装置，或身体/四肢状态已经发生变化，先调用 update_role_physical_state 记录现实变化，再继续回复或生成媒体；如果同一轮还要生成图片/视频，必须先更新状态再调用媒体工具。用户只是提出想象中的未来画面、写作设定或媒体 prompt 时，不要把它当成现实状态更新。",
+  "如果用户明确说角色已经换衣、拿起或放下物品、安装或移除身体内部装置，或身体/四肢状态已经发生变化，先调用 update_role_physical_state 记录现实变化，再继续回复或生成媒体；如果用户明确说角色已经到达、回到、来到、移动到某个地点，或当前正在做什么/处于什么环境已经改变，先调用 update_role_runtime_state 记录实际地点和场景。若同一轮还要生成图片/视频，所有状态更新必须先于媒体工具。用户只是提出想象中的未来画面、写作设定或媒体 prompt 时，不要把它当成现实状态更新。",
   "当用户明确要求角色用声音朗读、说出来、发语音或试听角色声音时，调用 generate_character_audio；工具结果标记 audioQueued 后只说明正在准备音频，完成后会单独发送，不能假称音频已生成。若运行时 ASMR/助眠语音模式已开启，不要手动传普通 voice_id，让工具自动使用当前角色的 ASMR 音色；语气和 text 也要更轻、更慢、更适合睡前聆听。",
   MEDIA_PROMPT_MODE === "guided"
     ? "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会直接附带已保存的人设图来锁定角色的面部、发型和参考图原生视觉风格。绝不预设为 2D、动漫或写实：人设图是什么风格，结果就保持什么风格。只有用户明确要求纯风景、纯物品、纯食物或画面中不要人物/角色时，才能设为 false；不要因为提示词没有重复角色名就设为 false。"
@@ -927,6 +935,46 @@ function getToolDefinitions(
           reason: {
             type: "string",
             description: "一句简短的现实变化原因，例如用户明确说‘她把手机放下了’。",
+          },
+        },
+        required: ["reason"],
+        additionalProperties: false,
+      },
+    },
+  });
+
+  tools.push({
+    type: "function",
+    function: {
+      name: "update_role_runtime_state",
+      description:
+        "记录当前角色已经发生的地点、活动、环境或情绪变化，并让后续文字、图片、视频和 3D 场景以这项现实状态为准。只有用户明确说角色已经到达/回到/来到/移动到某处，或明确说明当前正在做什么、处于什么环境时才使用；不要把未来设想、写作设定或媒体画面当作现实移动。地点更新会覆盖当天日程的当前位置，直到用户再次明确更新或日期变化。",
+      parameters: {
+        type: "object",
+        properties: {
+          location: {
+            type: "string",
+            description: "角色已经实际到达的当前地点，例如‘家里’、‘主卫’、‘办公室’。",
+          },
+          destination: {
+            type: "string",
+            description: "可选的明确移动目标；若已到达 location，通常不要填写。",
+          },
+          activity: {
+            type: "string",
+            description: "可选的当前实际活动，例如‘和主人聊天’。",
+          },
+          environment: {
+            type: "string",
+            description: "可选的当前实际环境，例如‘家里的客厅’。",
+          },
+          mood: {
+            type: "string",
+            description: "可选的当前情绪或精力状态。",
+          },
+          reason: {
+            type: "string",
+            description: "一句简短的现实变化依据，例如‘用户明确说已经瞬移到家里’。",
           },
         },
         required: ["reason"],
@@ -1757,6 +1805,8 @@ function normalizeRoleStateSnapshot(runtimeState) {
     destination: String(runtimeState.destination || "").slice(0, 120),
     environment: String(runtimeState.environment || "").slice(0, 240),
     mood: String(runtimeState.mood || "").slice(0, 80),
+    manualOverride: runtimeState.manualOverride === true,
+    runtimeOverrideUpdatedAt: String(runtimeState.runtimeOverrideUpdatedAt || "").slice(0, 80),
     physicalState,
     physicalStateChanges,
     outfit: typeof physicalState.outfit === "string" ? physicalState.outfit : "",
@@ -1872,7 +1922,7 @@ async function getRoleRuntimeStateForMedia(roleName, scope) {
   }
 }
 
-async function appendProactiveAssistantMessage(scope, content) {
+async function appendProactiveAssistantMessage(scope, content, runtimeState = null) {
   if (!scope || !content) {
     return;
   }
@@ -1886,7 +1936,15 @@ async function appendProactiveAssistantMessage(scope, content) {
         { _id: session._id, type: "chat-session" },
         {
           $set: {
-            messages: [...session.messages, { role: "assistant", content }],
+            messages: [...session.messages, {
+              role: "assistant",
+              content,
+              metadata: {
+                source: "role-schedule-proactive",
+                stateToken: String(runtimeState?.stateToken || "").slice(0, 300),
+                createdAt: new Date().toISOString(),
+              },
+            }],
             updatedAt: new Date().toISOString(),
           },
         },
@@ -1954,7 +2012,11 @@ async function sendProactiveRoleUpdate({ role, session, state }) {
       await bot.telegram
         .sendMessage(scope.chatId, `我正在${environment}${activity}，顺手拍一张给你看～📷`)
         .catch((error) => console.warn("发送角色主动图片进度消息失败:", error.message));
-      await appendProactiveAssistantMessage(scope, `[角色主动分享了一张关于“${activity}”的照片]`);
+      await appendProactiveAssistantMessage(
+        scope,
+        `[角色主动分享了一张关于“${activity}”的照片]`,
+        state.runtimeState,
+      );
       scheduleImageTask(taskRecord._id);
       return { type: "image", taskId: taskRecord._id };
     } catch (error) {
@@ -1964,7 +2026,7 @@ async function sendProactiveRoleUpdate({ role, session, state }) {
 
   const text = await generateRoleProactiveText({ role, state });
   await bot.telegram.sendMessage(scope.chatId, text);
-  await appendProactiveAssistantMessage(scope, text);
+  await appendProactiveAssistantMessage(scope, text, state.runtimeState);
   return { type: "text", text };
 }
 
@@ -2016,7 +2078,7 @@ function buildModelMessages(messages, runtimeContext = null) {
     content: [
       ...existingSystemMessages,
       toolInstruction.content,
-      "每轮请求都会在最新用户消息前注入一段临时实时状态；该状态优先于历史会话中的冲突叙事，且不会写入会话历史。",
+      "每轮请求都会由服务器在最新用户消息的开头附带一段临时实时状态；带有“系统附带”标签的内容优先于历史会话中的冲突叙事，且不会写入会话历史。",
     ].filter(Boolean).join("\n\n"),
   };
   const modelMessages = [systemMessage, ...conversationMessages];
@@ -2024,23 +2086,29 @@ function buildModelMessages(messages, runtimeContext = null) {
     return modelMessages;
   }
 
-  // Keep the complete, changing state next to the current user turn. The
-  // stable system prefix remains cacheable while the state can change every
-  // minute without invalidating the whole prompt prefix.
+  // MiniMax's Anthropic adapter merges every system message into one global
+  // prompt, so a temporary system anchor is no longer near the current turn.
+  // Keep the stable system prefix cacheable and prepend the changing state to
+  // the final user turn instead; it remains ordered correctly for both APIs.
   const latestUserIndex = modelMessages.findLastIndex(
     (messageRecord) => messageRecord?.role === "user",
   );
-  const stateAnchor = {
-    role: "system",
-    content: `本轮临时实时状态（只对本轮回复生效，不写入会话历史）：\n${runtimeInstruction}`,
-  };
-  if (latestUserIndex <= 0) {
-    return [...modelMessages, stateAnchor];
+  const runtimePrefix = [
+    "【系统附带：本轮实时角色状态（只对本轮回复生效，不写入会话历史）】",
+    runtimeInstruction,
+    "【以下才是用户本轮消息】",
+  ].join("\n");
+  if (latestUserIndex < 0) {
+    return [...modelMessages, { role: "user", content: runtimePrefix }];
   }
+  const latestUserMessage = modelMessages[latestUserIndex];
+  const content = Array.isArray(latestUserMessage.content)
+    ? [{ type: "text", text: `${runtimePrefix}\n` }, ...latestUserMessage.content]
+    : `${runtimePrefix}\n${String(latestUserMessage.content || "")}`;
   return [
     ...modelMessages.slice(0, latestUserIndex),
-    stateAnchor,
-    ...modelMessages.slice(latestUserIndex),
+    { ...latestUserMessage, content },
+    ...modelMessages.slice(latestUserIndex + 1),
   ];
 }
 
@@ -5142,15 +5210,19 @@ function guessAssetMimeType(relativePath) {
 
 async function executeToolCallsForRound(ctx, toolCalls, options) {
   const results = new Array(toolCalls.length);
-  const hasPhysicalStateUpdate = toolCalls.some((toolCall) =>
-    toolCall?.function?.name === "update_role_physical_state",
+  const stateUpdateToolNames = new Set([
+    "update_role_physical_state",
+    "update_role_runtime_state",
+  ]);
+  const hasStateUpdate = toolCalls.some((toolCall) =>
+    stateUpdateToolNames.has(toolCall?.function?.name),
   );
-  if (hasPhysicalStateUpdate) {
+  if (hasStateUpdate) {
     const orderedIndexes = toolCalls
       .map((_, index) => index)
       .sort((left, right) => {
-        const leftIsUpdate = toolCalls[left]?.function?.name === "update_role_physical_state";
-        const rightIsUpdate = toolCalls[right]?.function?.name === "update_role_physical_state";
+        const leftIsUpdate = stateUpdateToolNames.has(toolCalls[left]?.function?.name);
+        const rightIsUpdate = stateUpdateToolNames.has(toolCalls[right]?.function?.name);
         return Number(rightIsUpdate) - Number(leftIsUpdate) || left - right;
       });
     for (const index of orderedIndexes) {
@@ -5245,6 +5317,43 @@ async function executeToolCall(
       physicalStateUpdated: true,
       roleName: session.roleName,
       physicalState: result.physicalState,
+      updates: result.updates,
+    };
+  }
+
+  if (toolCall.function.name === "update_role_runtime_state") {
+    const scope = getScope(ctx);
+    const session = scope ? await findActiveSession(scope) : null;
+    if (!scope || !session?.roleName) {
+      return { ok: false, error: "请先用 /newchat 开启角色对话，再记录角色当前地点和场景。" };
+    }
+    const fieldAliases = {
+      location: "location",
+      destination: "destination",
+      activity: "activity",
+      environment: "environment",
+      mood: "mood",
+    };
+    const updates = {};
+    for (const [source, target] of Object.entries(fieldAliases)) {
+      if (Object.prototype.hasOwnProperty.call(args, source)) {
+        updates[target] = args[source];
+      }
+    }
+    const result = await roleSchedule.updateRuntimeState(
+      session.roleName,
+      scope,
+      updates,
+      { reason: args.reason, at: new Date() },
+    );
+    if (!result.ok) {
+      return result;
+    }
+    return {
+      ok: true,
+      runtimeStateUpdated: true,
+      roleName: session.roleName,
+      runtimeState: normalizeRoleStateSnapshot(result.runtimeState),
       updates: result.updates,
     };
   }
@@ -6320,6 +6429,15 @@ function getConversationTaskKey(scope) {
   return `${scope.chatId}:${scope.userId}`;
 }
 
+function getConversationMessageTaskId(scope, messageId) {
+  return [
+    "conversation-message-task",
+    String(scope.chatId),
+    String(scope.userId),
+    String(messageId),
+  ].join(":");
+}
+
 function createBackgroundContext({ chatId, userId, message = null }) {
   const chat = { id: chatId, type: "private" };
   const from = { id: userId };
@@ -6333,6 +6451,65 @@ function createBackgroundContext({ chatId, userId, message = null }) {
     replyWithDocument: (document, extra) => bot.telegram.sendDocument(chatId, document, extra),
     sendChatAction: (action) => bot.telegram.sendChatAction(chatId, action),
   };
+}
+
+function isRoleScheduleProactiveMessage(messageRecord) {
+  return messageRecord?.metadata?.source === "role-schedule-proactive";
+}
+
+function getSessionMessagesForModel(session) {
+  const storedMessages = Array.isArray(session?.messages) ? session.messages : [];
+  const systemMessages = storedMessages.filter((messageRecord) => messageRecord?.role === "system");
+  const requestedStart = Number(session?.modelContextStartIndex);
+  const startIndex = Number.isInteger(requestedStart)
+    ? Math.min(storedMessages.length, Math.max(0, requestedStart))
+    : 0;
+  let conversation = storedMessages
+    .slice(startIndex)
+    .filter((messageRecord) => messageRecord?.role !== "system")
+    .filter((messageRecord) => !isRoleScheduleProactiveMessage(messageRecord));
+  if (conversation.length > MODEL_CONVERSATION_MESSAGE_LIMIT) {
+    conversation = conversation.slice(-MODEL_CONVERSATION_MESSAGE_LIMIT);
+  }
+  // A truncated context must never start with a tool result whose associated
+  // assistant tool call has already been left out of the prompt.
+  while (conversation[0]?.role === "tool") {
+    conversation = conversation.slice(1);
+  }
+  return [...systemMessages, ...conversation];
+}
+
+function parseExplicitRuntimeLocationUpdate(text) {
+  const value = String(text || "").trim();
+  const match = value.match(
+    /^[（(]\s*(?:已经\s*)?(?:瞬移到|到达|回到|来到|移动到)\s*([^（）()\n，。！？!?]{1,80})\s*[）)]$/u,
+  );
+  const location = match?.[1]?.trim() || "";
+  return location && !["这里", "那里", "某处"].includes(location) ? location : "";
+}
+
+async function applyExplicitRuntimeLocationUpdate(scope, text) {
+  if (!ROLE_SCHEDULE_ENABLED) {
+    return null;
+  }
+  const location = parseExplicitRuntimeLocationUpdate(text);
+  if (!location) {
+    return null;
+  }
+  const session = await findActiveSession(scope);
+  if (!session?.roleName) {
+    return null;
+  }
+  const result = await roleSchedule.updateRuntimeState(
+    session.roleName,
+    scope,
+    { location },
+    { reason: `用户明确说明已经到达${location}`, at: new Date() },
+  );
+  if (!result.ok) {
+    throw new Error(result.error || "更新角色当前地点失败");
+  }
+  return result;
 }
 
 function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
@@ -6362,7 +6539,13 @@ function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
           userId: scope.userId,
           status: "pending",
         });
-        if (pending) {
+        const processing = pending && await db.findOneAsync({
+          type: "conversation-message-task",
+          chatId: scope.chatId,
+          userId: scope.userId,
+          status: "processing",
+        });
+        if (pending && !processing) {
           scheduleConversationTask(scope);
         }
       });
@@ -6386,7 +6569,7 @@ async function enqueueConversationMessage(ctx, scope, text) {
   }
 
   const now = new Date().toISOString();
-  const task = await db.insertAsync({
+  const taskDocument = {
     type: "conversation-message-task",
     chatId: scope.chatId,
     userId: scope.userId,
@@ -6395,31 +6578,95 @@ async function enqueueConversationMessage(ctx, scope, text) {
     status: "pending",
     receivedAt: now,
     createdAt: now,
-  });
+    ...(messageId !== undefined ? { _id: getConversationMessageTaskId(scope, messageId) } : {}),
+  };
+  let task;
+  try {
+    task = await db.insertAsync(taskDocument);
+  } catch (error) {
+    // Telegram may redeliver the same update to two PM2 processes at once.
+    // The deterministic SQLite document id is the final uniqueness barrier.
+    if (messageId !== undefined) {
+      const duplicate = await db.findOneAsync({
+        type: "conversation-message-task",
+        chatId: scope.chatId,
+        userId: scope.userId,
+        telegramMessageId: messageId,
+      });
+      if (duplicate) {
+        return duplicate;
+      }
+    }
+    throw error;
+  }
+  try {
+    await applyExplicitRuntimeLocationUpdate(scope, text);
+  } catch (error) {
+    // The message itself is already safely queued. A state-recording failure
+    // must not make Telegram retry it or make the user send it again.
+    console.warn("记录用户明确地点更新失败，将继续处理对话:", error.message || error);
+  }
   scheduleConversationTask(scope);
   return task;
 }
 
 async function processConversationTask(scope, { context = null, modelClient = openai } = {}) {
-  const pendingTasks = (await db.findAsync({
+  const pendingQuery = {
     type: "conversation-message-task",
     chatId: scope.chatId,
     userId: scope.userId,
     status: "pending",
-  })).sort((left, right) => {
+  };
+  const sortTasks = (tasks) => [...tasks].sort((left, right) => {
     const byTime = String(left.receivedAt).localeCompare(String(right.receivedAt));
     return byTime || Number(left.telegramMessageId || 0) - Number(right.telegramMessageId || 0);
   });
-  if (pendingTasks.length === 0) {
+  const pendingCandidates = sortTasks(await db.findAsync(pendingQuery));
+  if (pendingCandidates.length === 0) {
     return;
   }
 
+  const claimUpdate = {
+    $set: { status: "processing", startedAt: new Date().toISOString() },
+  };
+  let pendingTasks = [];
+  if (typeof db.claimManyAsync === "function") {
+    pendingTasks = sortTasks(await db.claimManyAsync(pendingQuery, claimUpdate, {
+      exclusiveQuery: {
+        type: "conversation-message-task",
+        chatId: scope.chatId,
+        userId: scope.userId,
+        status: "processing",
+      },
+    }));
+  } else {
+    for (const candidate of pendingCandidates) {
+      if (typeof db.claimOneAsync === "function") {
+        const claimed = await db.claimOneAsync(
+          { _id: candidate._id, status: "pending" },
+          claimUpdate,
+        );
+        if (claimed) {
+          pendingTasks.push(claimed);
+        }
+        continue;
+      }
+      // The in-memory NeDB test adapter does not expose an atomic claim API;
+      // still require the pending predicate so this fallback behaves correctly
+      // in one process.
+      const claimed = await db.updateAsync(
+        { _id: candidate._id, status: "pending" },
+        claimUpdate,
+      );
+      if (claimed.numAffected > 0) {
+        pendingTasks.push({ ...candidate, status: "processing" });
+      }
+    }
+  }
+  if (pendingTasks.length === 0) {
+    return;
+  }
   const taskIds = pendingTasks.map((task) => task._id);
-  await db.updateAsync(
-    { _id: { $in: taskIds }, status: "pending" },
-    { $set: { status: "processing", startedAt: new Date().toISOString() } },
-    { multi: true },
-  );
 
   const ctx = context || createBackgroundContext({ chatId: scope.chatId, userId: scope.userId });
   const session = await findActiveSession(scope);
@@ -6432,10 +6679,9 @@ async function processConversationTask(scope, { context = null, modelClient = op
     return;
   }
 
-  const messages = [
-    ...session.messages,
-    ...pendingTasks.map((task) => ({ role: "user", content: task.text })),
-  ];
+  const pendingUserMessages = pendingTasks.map((task) => ({ role: "user", content: task.text }));
+  const modelHistory = getSessionMessagesForModel(session);
+  const messages = [...modelHistory, ...pendingUserMessages];
   const batchText = pendingTasks.map((task) => task.text).join("\n");
   try {
     await ctx.sendChatAction("typing").catch(() => undefined);
@@ -6461,9 +6707,15 @@ async function processConversationTask(scope, { context = null, modelClient = op
       }),
       asmrEnabled,
     });
+    const generatedMessages = result.messages.slice(messages.length);
     await db.updateAsync(
       { _id: session._id, type: "chat-session" },
-      { $set: { messages: result.messages, updatedAt: new Date().toISOString() } },
+      {
+        $set: {
+          messages: [...session.messages, ...pendingUserMessages, ...generatedMessages],
+          updatedAt: new Date().toISOString(),
+        },
+      },
     );
     await db.updateAsync(
       { _id: { $in: taskIds } },
@@ -6492,11 +6744,15 @@ async function processConversationTask(scope, { context = null, modelClient = op
 
 async function resumePendingConversationTasks() {
   const tasks = await db.findAsync({ type: "conversation-message-task" });
+  const now = Date.now();
   for (const task of tasks) {
-    if (task.status === "processing") {
+    const startedAt = Date.parse(task.startedAt || "");
+    const processingLeaseExpired = !Number.isFinite(startedAt) ||
+      now - startedAt >= CONVERSATION_TASK_PROCESSING_LEASE_MS;
+    if (task.status === "processing" && processingLeaseExpired) {
       await db.updateAsync({ _id: task._id }, { $set: { status: "pending" } });
     }
-    if (["pending", "processing"].includes(task.status)) {
+    if (task.status === "pending" || (task.status === "processing" && processingLeaseExpired)) {
       scheduleConversationTask({ chatId: task.chatId, userId: task.userId });
     }
   }
@@ -8077,7 +8333,7 @@ bot.command("state", async (ctx) => {
     await replyWithText(
       ctx,
       `「${session.roleName}」当前实体状态：\n\n` +
-        `活动：${state.current.activity}\n` +
+        `活动：${runtime.activity || state.current.activity}${runtime.manualOverride ? "（已按当前对话更新）" : ""}\n` +
         `地点：${runtime.location || "未记录"}\n` +
         `${formatRolePhysicalState(runtime)}`,
     );
@@ -8908,6 +9164,8 @@ module.exports = {
   buildModelMessages,
   db,
   findActiveSession,
+  getSessionMessagesForModel,
+  parseExplicitRuntimeLocationUpdate,
   processConversationTask,
   replaceActiveSession,
   roleStore,

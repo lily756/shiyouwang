@@ -58,6 +58,53 @@ test("SQLite document adapter supports the NeDB-shaped CRUD surface", async () =
   }
 });
 
+test("SQLite atomically claims one pending document", async () => {
+  const db = createSqliteDatabase({ filename: ":memory:" });
+  try {
+    await db.insertAsync({ _id: "task-1", type: "task", status: "pending" });
+    const first = await db.claimOneAsync(
+      { type: "task", status: "pending" },
+      { $set: { status: "processing", startedAt: "2026-08-16T15:00:00.000Z" } },
+    );
+    const second = await db.claimOneAsync(
+      { type: "task", status: "pending" },
+      { $set: { status: "processing" } },
+    );
+
+    assert.equal(first._id, "task-1");
+    assert.equal(first.status, "processing");
+    assert.equal(second, null);
+    assert.equal((await db.findOneAsync({ _id: "task-1" })).startedAt, "2026-08-16T15:00:00.000Z");
+  } finally {
+    db.close();
+  }
+});
+
+test("SQLite claims one queue batch per scope while another batch is processing", async () => {
+  const db = createSqliteDatabase({ filename: ":memory:" });
+  try {
+    await db.insertAsync([
+      { _id: "queued-1", type: "queue", scope: "chat:1", status: "pending" },
+      { _id: "queued-2", type: "queue", scope: "chat:1", status: "pending" },
+    ]);
+    const first = await db.claimManyAsync(
+      { type: "queue", scope: "chat:1", status: "pending" },
+      { $set: { status: "processing" } },
+      { exclusiveQuery: { type: "queue", scope: "chat:1", status: "processing" } },
+    );
+    const second = await db.claimManyAsync(
+      { type: "queue", scope: "chat:1", status: "pending" },
+      { $set: { status: "processing" } },
+      { exclusiveQuery: { type: "queue", scope: "chat:1", status: "processing" } },
+    );
+
+    assert.deepEqual(first.map((document) => document._id).sort(), ["queued-1", "queued-2"]);
+    assert.deepEqual(second, []);
+  } finally {
+    db.close();
+  }
+});
+
 test("migrates an existing NeDB data file once and preserves document ids", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "localtest-sqlite-migration-"));
   const legacyFilename = path.join(directory, "data");

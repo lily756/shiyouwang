@@ -15,6 +15,7 @@ const {
   normalizeScheduleEntries,
   normalizePhysicalState,
   ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE,
+  ROLE_RUNTIME_OVERRIDE_RECORD_TYPE,
   ROLE_STATE_RECORD_TYPE,
   SCHEDULE_VERSION,
 } = require("../lib/role-schedule");
@@ -65,6 +66,36 @@ test("reserves preparation and travel time between explicitly different location
   assert.equal(isBehaviorEntry(preparation), false);
   assert.equal(isBehaviorEntry(commute), false);
   assert.equal(isIdleEntry(commute), false);
+  assert.equal(entries.every((entry, index) => index === 0 || entry.startMinute === entries[index - 1].endMinute), true);
+});
+
+test("uses a one-minute indoor walk instead of an outdoor departure flow", () => {
+  const entries = normalizeScheduleEntries({
+    entries: [
+      {
+        start: "00:00",
+        end: "22:45",
+        kind: "work",
+        activity: "在主卧工作角整理东西",
+        location: "主卧工作角",
+      },
+      {
+        start: "22:45",
+        end: "23:00",
+        kind: "routine",
+        activity: "去主卫洗漱",
+        location: "主卫",
+      },
+      { start: "23:00", end: "24:00", kind: "rest", activity: "休息", location: "主卫" },
+    ],
+  });
+
+  const commute = entries.find((entry) => entry.kind === "commute");
+  assert.equal(entries.some((entry) => entry.kind === "prepare"), false);
+  assert.equal(commute.indoorMovement, true);
+  assert.equal(commute.travelMinutes, 1);
+  assert.match(commute.activity, /在室内从主卧工作角步行前往主卫/);
+  assert.doesNotMatch(commute.activity, /路上交通|换衣服|钥匙/);
   assert.equal(entries.every((entry, index) => index === 0 || entry.startMinute === entries[index - 1].endMinute), true);
 });
 
@@ -283,7 +314,7 @@ test("rejects unannounced physical state changes in ordinary schedule entries", 
   assert.equal(work.heldItems, undefined);
 });
 
-test("runtime state inherits physical facts and records explicit clears", async () => {
+test("runtime state keeps durable physical facts but expires schedule-only action snapshots", async () => {
   const db = new Datastore({ inMemoryOnly: true });
   const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
   const manager = createRoleScheduleManager({
@@ -341,10 +372,10 @@ test("runtime state inherits physical facts and records explicit clears", async 
     at: new Date("2026-08-04T09:00:00.000Z"),
   });
   assert.equal(morning.runtimeState.outfit, "灰色家居服");
-  assert.deepEqual(morning.runtimeState.physicalState.heldItems, ["手机"]);
+  assert.equal(morning.runtimeState.physicalState.heldItems, undefined);
   assert.deepEqual(morning.runtimeState.physicalState.internalDevices, ["左耳人工耳蜗"]);
   assert.equal(morning.runtimeState.physicalState.bodyState, "专注");
-  assert.equal(morning.runtimeState.physicalState.limbStates.leftArm, "自然下垂");
+  assert.equal(morning.runtimeState.physicalState.limbStates.leftArm, undefined);
   assert.equal(morning.runtimeState.physicalState.limbStates.rightHand, "敲键盘");
 
   const prepared = await manager.getState(role.name, {
@@ -355,10 +386,63 @@ test("runtime state inherits physical facts and records explicit clears", async 
   assert.deepEqual(prepared.runtimeState.physicalState.carriedItems, []);
   assert.deepEqual(prepared.runtimeState.physicalState.internalDevices, ["左耳人工耳蜗"]);
   assert.equal(prepared.runtimeState.physicalState.limbStates.rightHand, undefined);
-  assert.equal(prepared.runtimeState.physicalState.limbStates.leftArm, "自然下垂");
+  assert.equal(prepared.runtimeState.physicalState.limbStates.leftArm, undefined);
   assert.deepEqual(prepared.runtimeState.physicalStateChanges.heldItems.to, []);
   assert.deepEqual(prepared.runtimeState.physicalStateChanges.carriedItems.to, []);
   assert.match(manager.buildRuntimeContextFromState(prepared), /当前手持物品：双手空着/);
+});
+
+test("does not leak a schedule-only dishwashing state into later evening entries", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        {
+          start: "00:00",
+          end: "12:00",
+          kind: "rest",
+          activity: "休息",
+          location: "家",
+          physicalState: { outfit: "家居服" },
+        },
+        {
+          start: "12:00",
+          end: "12:10",
+          kind: "routine",
+          activity: "收拾餐桌、洗碗",
+          location: "厨房",
+          physicalState: {
+            heldItems: ["洗碗海绵"],
+            bodyState: "轻微活动",
+            limbStates: { leftArm: "拿碗冲水", rightArm: "捏海绵擦拭" },
+          },
+        },
+        { start: "12:10", end: "24:00", kind: "rest", activity: "休息", location: "厨房" },
+      ],
+    }),
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 71, userId: 72 };
+
+  const washing = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T12:05:00.000Z"),
+  });
+  assert.deepEqual(washing.runtimeState.physicalState.heldItems, ["洗碗海绵"]);
+  assert.equal(washing.runtimeState.physicalState.limbStates.rightArm, "捏海绵擦拭");
+
+  const later = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T13:00:00.000Z"),
+  });
+  assert.equal(later.runtimeState.outfit, "家居服");
+  assert.equal(later.runtimeState.physicalState.heldItems, undefined);
+  assert.equal(later.runtimeState.physicalState.bodyState, undefined);
+  assert.equal(later.runtimeState.physicalState.limbStates, undefined);
 });
 
 test("explicit physical state updates persist into later schedule entries", async () => {
@@ -412,6 +496,50 @@ test("explicit physical state updates persist into later schedule entries", asyn
     (await db.findAsync({ type: ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE })).length,
     1,
   );
+});
+
+test("explicit runtime updates override today's plan only for the active conversation", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "24:00", kind: "work", activity: "在办公室工作", location: "办公室", environment: "工位" },
+      ],
+    }),
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 55, userId: 56 };
+  const at = new Date("2026-08-04T09:00:00.000Z");
+  const updated = await manager.updateRuntimeState(
+    role.name,
+    scope,
+    { location: "家里客厅", activity: "和主人聊天", environment: "家里的沙发旁" },
+    { at, reason: "用户明确说已经回到家里" },
+  );
+
+  assert.equal(updated.ok, true);
+  assert.equal(updated.runtimeState.manualOverride, true);
+  assert.equal(updated.runtimeState.status, "stable");
+  assert.equal(updated.runtimeState.location, "家里客厅");
+  assert.equal(updated.runtimeState.activity, "和主人聊天");
+
+  const later = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-04T11:00:00.000Z"),
+  });
+  assert.equal(later.runtimeState.location, "家里客厅");
+  assert.match(manager.buildRuntimeContextFromState(later), /当前实际状态以用户明确更新为准：和主人聊天/);
+
+  const otherUser = await manager.getState(role.name, {
+    scope: { chatId: 57, userId: 58 },
+    at,
+  });
+  assert.equal(otherUser.runtimeState.location, "办公室");
+  assert.equal((await db.findAsync({ type: ROLE_RUNTIME_OVERRIDE_RECORD_TYPE })).length, 1);
 });
 
 test("internal device updates carry forward to the next day", async () => {
