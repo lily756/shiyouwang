@@ -191,6 +191,125 @@ test("processes a role conversation through SQLite and persists the assistant re
       reply: async (text) => replies.push(String(text)),
       telegram: { sendMessage: async () => undefined },
     };
+
+    const repeatedStateCalls = [
+      {
+        id: "state-update-1",
+        type: "function",
+        function: {
+          name: "update_role_physical_state",
+          arguments: JSON.stringify({
+            outfit: "睡衣",
+            limb_states: { leftArm: "放在身侧" },
+            reason: "用户明确说换上睡衣",
+          }),
+        },
+      },
+      {
+        id: "state-update-2",
+        type: "function",
+        function: {
+          name: "update_role_physical_state",
+          arguments: JSON.stringify({
+            body_state: "清醒",
+            limb_states: { rightArm: "拿着手机" },
+            reason: "用户补充当前状态",
+          }),
+        },
+      },
+    ];
+    const executedStateCalls = [];
+    const coalescedStateResults = await app.executeToolCallsForRound(
+      context,
+      repeatedStateCalls,
+      {
+        executeToolCallFn: async (_ctx, toolCall) => {
+          executedStateCalls.push(toolCall);
+          return { ok: true, physicalStateUpdated: true };
+        },
+      },
+    );
+    assert.equal(executedStateCalls.length, 1);
+    assert.equal(executedStateCalls[0].id, "state-update-2");
+    assert.deepEqual(JSON.parse(executedStateCalls[0].function.arguments), {
+      outfit: "睡衣",
+      body_state: "清醒",
+      limb_states: { leftArm: "放在身侧", rightArm: "拿着手机" },
+      reason: "用户补充当前状态",
+    });
+    assert.equal(coalescedStateResults[0].stateUpdateCoalesced, true);
+    assert.equal(coalescedStateResults[0].mergedIntoToolCallId, "state-update-2");
+
+    const stateUpdateRequests = [];
+    const stateUpdateResult = await app.runModelWithTools(
+      context,
+      [
+        { role: "system", content: "你是测试角色。" },
+        { role: "user", content: "角色已经换上睡衣。" },
+      ],
+      {
+        client: {
+          chat: {
+            completions: {
+              create: async (request) => {
+                stateUpdateRequests.push(request);
+                if (stateUpdateRequests.length === 1) {
+                  return {
+                    choices: [{
+                      message: {
+                        role: "assistant",
+                        content: null,
+                        tool_calls: [{
+                          id: "state-update-round-1",
+                          type: "function",
+                          function: {
+                            name: "update_role_physical_state",
+                            arguments: JSON.stringify({
+                              outfit: "睡衣",
+                              reason: "用户明确说角色已经换上睡衣",
+                            }),
+                          },
+                        }],
+                      },
+                    }],
+                  };
+                }
+                return {
+                  choices: [{
+                    message: {
+                      role: "assistant",
+                      content: "已经记下来了。",
+                    },
+                  }],
+                };
+              },
+            },
+          },
+        },
+        toolExecutor: async () => [{ ok: true, physicalStateUpdated: true }],
+      },
+    );
+    assert.equal(stateUpdateRequests.length, 2);
+    assert.equal(
+      stateUpdateRequests[0].tools.some(
+        (tool) => tool.function.name === "update_role_physical_state",
+      ),
+      true,
+    );
+    assert.equal(
+      stateUpdateRequests[1].tools.some(
+        (tool) => tool.function.name === "update_role_physical_state",
+      ),
+      false,
+    );
+    assert.equal(
+      stateUpdateRequests[1].tools.some(
+        (tool) => tool.function.name === "update_role_runtime_state",
+      ),
+      true,
+    );
+    assert.equal(stateUpdateResult.answer, "已经记下来了。");
+
     const requests = [];
     const modelClient = {
       chat: {

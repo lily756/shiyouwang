@@ -112,6 +112,10 @@ const GENERATION_TASK_LOG_FILE = path.join(
 );
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const MAX_TOOL_ROUNDS = 4;
+const STATE_UPDATE_TOOL_NAMES = new Set([
+  "update_role_physical_state",
+  "update_role_runtime_state",
+]);
 const MCD_AUTO_LOAD_ENABLED = !["false", "0", "no", "off"].includes(
   String(process.env.MCD_AUTO_LOAD_ENABLED || "true").trim().toLowerCase(),
 );
@@ -2191,6 +2195,114 @@ function parseToolArguments(rawArguments) {
     return { ok: true, value: parsed };
   } catch {
     return { ok: false, error: "工具参数 JSON 无法解析。" };
+  }
+}
+
+function getToolCallName(toolCall) {
+  return String(toolCall?.function?.name || "");
+}
+
+function isStateUpdateToolCall(toolCall) {
+  return STATE_UPDATE_TOOL_NAMES.has(getToolCallName(toolCall));
+}
+
+function filterCompletedStateUpdateTools(tools, completedStateUpdateTools = new Set()) {
+  if (!(completedStateUpdateTools instanceof Set) || completedStateUpdateTools.size === 0) {
+    return tools;
+  }
+  return tools.filter((tool) => !completedStateUpdateTools.has(
+    String(tool?.function?.name || ""),
+  ));
+}
+
+function mergeStateUpdateArguments(toolName, argumentValues) {
+  const merged = {};
+  const fieldNames = toolName === "update_role_physical_state"
+    ? ["outfit", "carried_items", "held_items", "internal_devices", "body_state", "limb_states"]
+    : ["location", "destination", "activity", "environment", "mood"];
+  for (const args of argumentValues) {
+    for (const fieldName of fieldNames) {
+      if (!Object.prototype.hasOwnProperty.call(args, fieldName)) {
+        continue;
+      }
+      const value = args[fieldName];
+      if (
+        toolName === "update_role_physical_state"
+        && fieldName === "limb_states"
+        && value
+        && typeof value === "object"
+        && !Array.isArray(value)
+      ) {
+        const previous = merged.limb_states
+          && typeof merged.limb_states === "object"
+          && !Array.isArray(merged.limb_states)
+          ? merged.limb_states
+          : {};
+        merged.limb_states = { ...previous, ...value };
+      } else {
+        merged[fieldName] = value;
+      }
+    }
+    if (typeof args.reason === "string" && args.reason.trim()) {
+      merged.reason = args.reason.trim();
+    }
+  }
+  return merged;
+}
+
+function coalesceStateUpdateToolCalls(toolCalls) {
+  const originalCalls = Array.isArray(toolCalls) ? toolCalls : [];
+  const executableCalls = [...originalCalls];
+  const mergedIntoIndexes = new Map();
+  const groups = new Map();
+
+  for (const [index, toolCall] of originalCalls.entries()) {
+    const toolName = getToolCallName(toolCall);
+    if (!STATE_UPDATE_TOOL_NAMES.has(toolName)) {
+      continue;
+    }
+    const parsed = parseToolArguments(toolCall?.function?.arguments);
+    if (!parsed.ok) {
+      continue;
+    }
+    const group = groups.get(toolName) || [];
+    group.push({ index, arguments: parsed.value });
+    groups.set(toolName, group);
+  }
+
+  for (const [toolName, group] of groups.entries()) {
+    if (group.length < 2) {
+      continue;
+    }
+    const primary = group.at(-1);
+    const primaryCall = originalCalls[primary.index];
+    const mergedArguments = mergeStateUpdateArguments(
+      toolName,
+      group.map((item) => item.arguments),
+    );
+    executableCalls[primary.index] = {
+      ...primaryCall,
+      function: {
+        ...primaryCall.function,
+        arguments: JSON.stringify(mergedArguments),
+      },
+    };
+    for (const item of group.slice(0, -1)) {
+      mergedIntoIndexes.set(item.index, primary.index);
+    }
+  }
+
+  return { executableCalls, mergedIntoIndexes };
+}
+
+function recordCompletedStateUpdateTools(toolCalls, toolResults, completedStateUpdateTools) {
+  if (!(completedStateUpdateTools instanceof Set)) {
+    return;
+  }
+  for (const [index, toolCall] of (Array.isArray(toolCalls) ? toolCalls : []).entries()) {
+    if (isStateUpdateToolCall(toolCall) && toolResults?.[index]?.ok === true) {
+      completedStateUpdateTools.add(getToolCallName(toolCall));
+    }
   }
 }
 
@@ -5226,48 +5338,61 @@ function guessAssetMimeType(relativePath) {
 }
 
 async function executeToolCallsForRound(ctx, toolCalls, options) {
-  const results = new Array(toolCalls.length);
-  const stateUpdateToolNames = new Set([
-    "update_role_physical_state",
-    "update_role_runtime_state",
-  ]);
-  const hasStateUpdate = toolCalls.some((toolCall) =>
-    stateUpdateToolNames.has(toolCall?.function?.name),
+  const originalCalls = Array.isArray(toolCalls) ? toolCalls : [];
+  const results = new Array(originalCalls.length);
+  const executeOne = options?.executeToolCallFn || executeToolCall;
+  const { executableCalls, mergedIntoIndexes } = coalesceStateUpdateToolCalls(originalCalls);
+  const executableIndexes = originalCalls
+    .map((_, index) => index)
+    .filter((index) => !mergedIntoIndexes.has(index));
+  const hasStateUpdate = executableIndexes.some((index) =>
+    isStateUpdateToolCall(executableCalls[index]),
   );
   if (hasStateUpdate) {
-    const orderedIndexes = toolCalls
-      .map((_, index) => index)
+    const orderedIndexes = [...executableIndexes]
       .sort((left, right) => {
-        const leftIsUpdate = stateUpdateToolNames.has(toolCalls[left]?.function?.name);
-        const rightIsUpdate = stateUpdateToolNames.has(toolCalls[right]?.function?.name);
+        const leftIsUpdate = isStateUpdateToolCall(executableCalls[left]);
+        const rightIsUpdate = isStateUpdateToolCall(executableCalls[right]);
         return Number(rightIsUpdate) - Number(leftIsUpdate) || left - right;
       });
     for (const index of orderedIndexes) {
-      results[index] = await executeToolCall(ctx, toolCalls[index], options);
+      results[index] = await executeOne(ctx, executableCalls[index], options);
     }
-    return results;
+  } else {
+    const parallelIndexes = [];
+    const serialIndexes = [];
+
+    executableIndexes.forEach((index) => {
+      if (isParallelMediaToolCall(executableCalls[index])) {
+        parallelIndexes.push(index);
+      } else {
+        serialIndexes.push(index);
+      }
+    });
+
+    // Independent media tasks can be queued together. Non-media tools remain
+    // ordered because MCP actions and life-assistant mutations may depend on
+    // the preceding result.
+    await Promise.all(
+      parallelIndexes.map(async (index) => {
+        results[index] = await executeOne(ctx, executableCalls[index], options);
+      }),
+    );
+    for (const index of serialIndexes) {
+      results[index] = await executeOne(ctx, executableCalls[index], options);
+    }
   }
-  const parallelIndexes = [];
-  const serialIndexes = [];
 
-  toolCalls.forEach((toolCall, index) => {
-    if (isParallelMediaToolCall(toolCall)) {
-      parallelIndexes.push(index);
-    } else {
-      serialIndexes.push(index);
-    }
-  });
-
-  // Independent media tasks can be queued together. Non-media tools remain
-  // ordered because MCP actions and life-assistant mutations may depend on
-  // the preceding result.
-  await Promise.all(
-    parallelIndexes.map(async (index) => {
-      results[index] = await executeToolCall(ctx, toolCalls[index], options);
-    }),
-  );
-  for (const index of serialIndexes) {
-    results[index] = await executeToolCall(ctx, toolCalls[index], options);
+  for (const [mergedIndex, primaryIndex] of mergedIntoIndexes.entries()) {
+    const primaryResult = results[primaryIndex];
+    results[mergedIndex] = {
+      ok: primaryResult?.ok === true,
+      stateUpdateCoalesced: true,
+      mergedIntoToolCallId: String(originalCalls[primaryIndex]?.id || ""),
+      ...(primaryResult?.ok === true
+        ? { message: "同一轮重复的状态更新已合并并写入。" }
+        : { error: primaryResult?.error || "合并后的状态更新失败。" }),
+    };
   }
   return results;
 }
@@ -5333,8 +5458,8 @@ async function executeToolCall(
       ok: true,
       physicalStateUpdated: true,
       roleName: session.roleName,
-      physicalState: result.physicalState,
       updates: result.updates,
+      message: "实体状态已记录。本轮不要再次调用 update_role_physical_state，继续完成对用户的回复。",
     };
   }
 
@@ -5370,8 +5495,8 @@ async function executeToolCall(
       ok: true,
       runtimeStateUpdated: true,
       roleName: session.roleName,
-      runtimeState: normalizeRoleStateSnapshot(result.runtimeState),
       updates: result.updates,
+      message: "当前地点和场景已记录。本轮不要再次调用 update_role_runtime_state，继续完成对用户的回复。",
     };
   }
 
@@ -6104,6 +6229,7 @@ async function runModelWithAnthropicTools(
     forceImageEdit = false,
     mcdContext = null,
     asmrEnabled = false,
+    toolExecutor = executeToolCallsForRound,
   } = {},
 ) {
   if (!minimaxAnthropic) {
@@ -6115,6 +6241,7 @@ async function runModelWithAnthropicTools(
   let terminalAnswer = "";
   const imageGenerationState = { totalCount: 0, imageCount: 0 };
   const imageEditState = { usedReferenceIds: new Set() };
+  const completedStateUpdateTools = new Set();
   let activeMcdContext = mcdContext;
   let ownsMcdContext = false;
   const roleScheduleContext = await getRoleScheduleRuntimeContext(ctx);
@@ -6137,12 +6264,15 @@ async function runModelWithAnthropicTools(
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const settings = await getToolSettings();
-      const tools = getToolDefinitions(ctx, {
-        mcdContext: activeMcdContext,
-        imageEditReference,
-        imageEditHistory,
-        videoReferenceHistory,
-      });
+      const tools = filterCompletedStateUpdateTools(
+        getToolDefinitions(ctx, {
+          mcdContext: activeMcdContext,
+          imageEditReference,
+          imageEditHistory,
+          videoReferenceHistory,
+        }),
+        completedStateUpdateTools,
+      );
       const modelMessages = buildModelMessages(
         conversation,
         buildToolRuntimeContext(settings, {
@@ -6211,7 +6341,7 @@ async function runModelWithAnthropicTools(
         return { answer: "工具调用次数已达上限，请换一种问法后重试。", messages: conversation };
       }
 
-      const toolResults = await executeToolCallsForRound(ctx, toolCalls, {
+      const toolResults = await toolExecutor(ctx, toolCalls, {
         imageEditReference,
         imageEditHistory,
         videoReferenceHistory,
@@ -6221,6 +6351,11 @@ async function runModelWithAnthropicTools(
         promptContext: serializeImagePromptContext(conversation),
         promptModel: model || minimaxProvider.config.textModel,
       });
+      recordCompletedStateUpdateTools(
+        toolCalls,
+        toolResults,
+        completedStateUpdateTools,
+      );
       const toolResultBlocks = [];
       for (const [index, toolCall] of toolCalls.entries()) {
         const result = toolResults[index];
@@ -6263,6 +6398,7 @@ async function runModelWithTools(
     forceImageEdit = false,
     mcdContext = null,
     asmrEnabled = false,
+    toolExecutor = executeToolCallsForRound,
   } = {},
 ) {
   if (MINIMAX_ENABLED && minimaxAnthropic) {
@@ -6274,6 +6410,7 @@ async function runModelWithTools(
       mcdContext,
       asmrEnabled,
       model,
+      toolExecutor,
     });
   }
   const conversation = [...messages];
@@ -6282,6 +6419,7 @@ async function runModelWithTools(
   let terminalAnswer = "";
   const imageGenerationState = { totalCount: 0, imageCount: 0 };
   const imageEditState = { usedReferenceIds: new Set() };
+  const completedStateUpdateTools = new Set();
   let activeMcdContext = mcdContext;
   let ownsMcdContext = false;
   const roleScheduleContext = await getRoleScheduleRuntimeContext(ctx);
@@ -6304,12 +6442,15 @@ async function runModelWithTools(
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
       const settings = await getToolSettings();
-      const tools = getToolDefinitions(ctx, {
-        mcdContext: activeMcdContext,
-        imageEditReference,
-        imageEditHistory,
-        videoReferenceHistory,
-      });
+      const tools = filterCompletedStateUpdateTools(
+        getToolDefinitions(ctx, {
+          mcdContext: activeMcdContext,
+          imageEditReference,
+          imageEditHistory,
+          videoReferenceHistory,
+        }),
+        completedStateUpdateTools,
+      );
       const request = {
         model,
         messages: buildModelMessages(
@@ -6392,7 +6533,7 @@ async function runModelWithTools(
         };
       }
 
-      const toolResults = await executeToolCallsForRound(ctx, toolCalls, {
+      const toolResults = await toolExecutor(ctx, toolCalls, {
         imageEditReference,
         imageEditHistory,
         videoReferenceHistory,
@@ -6402,6 +6543,11 @@ async function runModelWithTools(
         promptContext: serializeImagePromptContext(conversation),
         promptModel: model || TEXT_MODEL,
       });
+      recordCompletedStateUpdateTools(
+        toolCalls,
+        toolResults,
+        completedStateUpdateTools,
+      );
       for (const [index, toolCall] of toolCalls.entries()) {
         const result = toolResults[index];
         deliveredImage ||= result.imageDelivered === true;
@@ -9180,11 +9326,15 @@ if (require.main === module) {
 
 module.exports = {
   buildModelMessages,
+  coalesceStateUpdateToolCalls,
   db,
+  executeToolCallsForRound,
   findActiveSession,
+  filterCompletedStateUpdateTools,
   getSessionMessagesForModel,
   parseExplicitRuntimeLocationUpdate,
   processConversationTask,
   replaceActiveSession,
   roleStore,
+  runModelWithTools,
 };
