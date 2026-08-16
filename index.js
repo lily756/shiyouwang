@@ -1993,22 +1993,57 @@ function buildModelMessages(messages, runtimeContext = null) {
     role: "system",
     content: `${TOOL_USE_SYSTEM_PROMPT}\n${getVideoPromptSystemInstruction()}`,
   };
-  const systemInstructions = [toolInstruction];
-  if (runtimeContext) {
-    systemInstructions.push(runtimeContext);
-  }
-  const firstSystemMessageIndex = messages.findIndex(
-    (messageRecord) => messageRecord.role === "system",
+  const existingSystemMessages = messages
+    .filter((messageRecord) => messageRecord?.role === "system")
+    .map((messageRecord) => String(messageRecord.content || "").trim())
+    .filter(Boolean);
+  const conversationMessages = messages.filter(
+    (messageRecord) => messageRecord?.role !== "system",
   );
-
-  if (firstSystemMessageIndex === -1) {
-    return [...systemInstructions, ...messages];
+  const runtimeContent = typeof runtimeContext === "string"
+    ? runtimeContext.trim()
+    : String(runtimeContext?.content || "").trim();
+  const runtimeInstruction = runtimeContent
+    ? [
+        "实时状态优先级规则（高于历史会话）：",
+        "下面的角色日程运行时状态是角色此刻的唯一现实。历史消息中的地点、活动、穿着、物品、身体和场景只代表过去叙事；如果与实时状态冲突，必须丢弃冲突的旧场景，不能继续演绎成当前正在发生。",
+        runtimeContent,
+        "回复前自检：普通聊天也必须从当前活动和地点自然回应；只有用户明确要求回忆、假设或创作时，才可以描述旧场景或未来场景，但不能把它说成角色此刻正在那里。",
+      ].join("\n")
+    : "";
+  const systemMessage = {
+    role: "system",
+    content: [
+      ...existingSystemMessages,
+      toolInstruction.content,
+      runtimeInstruction,
+    ].filter(Boolean).join("\n\n"),
+  };
+  const modelMessages = [systemMessage, ...conversationMessages];
+  if (!runtimeInstruction) {
+    return modelMessages;
   }
 
+  // Keep a short, fresh state anchor next to the current user turn. Some
+  // OpenAI-compatible providers pay more attention to the most recent
+  // instruction than to a second system message placed at the beginning.
+  const latestUserIndex = modelMessages.findLastIndex(
+    (messageRecord) => messageRecord?.role === "user",
+  );
+  if (latestUserIndex <= 0) {
+    return modelMessages;
+  }
+  const stateAnchor = {
+    role: "system",
+    content: [
+      "本轮回复的实时状态复核：",
+      "以紧邻前文提供的实时状态为准；不要沿用与它冲突的旧电影、旧地点或旧动作。",
+    ].join("\n"),
+  };
   return [
-    ...messages.slice(0, firstSystemMessageIndex + 1),
-    ...systemInstructions,
-    ...messages.slice(firstSystemMessageIndex + 1),
+    ...modelMessages.slice(0, latestUserIndex),
+    stateAnchor,
+    ...modelMessages.slice(latestUserIndex),
   ];
 }
 
@@ -8873,6 +8908,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  buildModelMessages,
   db,
   findActiveSession,
   processConversationTask,

@@ -40,6 +40,26 @@ test("processes a role conversation through SQLite and persists the assistant re
   let app = null;
   try {
     app = require("../index");
+    const modelMessages = app.buildModelMessages(
+      [
+        { role: "system", content: "你是一个长期陪伴用户的角色。" },
+        { role: "assistant", content: "我们还在电影院里看电影。" },
+        { role: "user", content: "喵" },
+      ],
+      {
+        role: "system",
+        content: "角色日程运行时状态：当前地点：主卧工作角；当前活动：前往主卫；状态：in_transit。",
+      },
+    );
+    assert.equal(modelMessages[0].role, "system");
+    assert.match(modelMessages[0].content, /唯一现实/);
+    assert.match(modelMessages[0].content, /主卧工作角/);
+    const latestUserIndex = modelMessages.findLastIndex((message) => message.role === "user");
+    const anchorIndex = modelMessages.findIndex(
+      (message) => message.role === "system" && /实时状态复核/.test(message.content),
+    );
+    assert.ok(anchorIndex > 0 && anchorIndex < latestUserIndex);
+
     await app.db.ready;
     const role = (await app.roleStore.getRoles()).find((item) => item.name === "测试角色");
     assert.ok(role);
