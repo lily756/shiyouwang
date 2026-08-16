@@ -436,6 +436,7 @@ const roleStore = createRoleStore({
   createConversationExportFilename,
 });
 const {
+  endActiveSession,
   exportActiveSession,
   findActiveSession,
   findRole,
@@ -6790,7 +6791,7 @@ function parseExplicitRuntimeLocationUpdate(text) {
   return location && !["这里", "那里", "某处"].includes(location) ? location : "";
 }
 
-async function applyExplicitRuntimeLocationUpdate(scope, text) {
+async function applyExplicitRuntimeLocationUpdate(scope, text, { sessionId = null } = {}) {
   if (!ROLE_SCHEDULE_ENABLED) {
     return null;
   }
@@ -6799,7 +6800,7 @@ async function applyExplicitRuntimeLocationUpdate(scope, text) {
     return null;
   }
   const session = await findActiveSession(scope);
-  if (!session?.roleName) {
+  if (!session?.roleName || (sessionId && session._id !== sessionId)) {
     return null;
   }
   const result = await roleSchedule.updateRuntimeState(
@@ -6812,6 +6813,101 @@ async function applyExplicitRuntimeLocationUpdate(scope, text) {
     throw new Error(result.error || "更新角色当前地点失败");
   }
   return result;
+}
+
+function clearConversationDebounceTimer(scope) {
+  const key = getConversationTaskKey(scope);
+  const timer = conversationDebounceTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    conversationDebounceTimers.delete(key);
+  }
+}
+
+async function discardPendingConversationTasks(
+  scope,
+  { sessionId = null, reason = "会话已切换或结束" } = {},
+) {
+  const pendingTasks = await db.findAsync({
+    type: "conversation-message-task",
+    chatId: scope.chatId,
+    userId: scope.userId,
+    status: "pending",
+  });
+  const tasksToDiscard = pendingTasks.filter((task) => (
+    !sessionId || !task.sessionId || task.sessionId === sessionId
+  ));
+  if (tasksToDiscard.length === 0) {
+    return 0;
+  }
+  await db.updateAsync(
+    { _id: { $in: tasksToDiscard.map((task) => task._id) }, status: "pending" },
+    {
+      $set: {
+        status: "discarded",
+        discardedAt: new Date().toISOString(),
+        discardReason: String(reason).slice(0, 160),
+      },
+    },
+    { multi: true },
+  );
+  return tasksToDiscard.length;
+}
+
+async function synchronizeRoleRuntimeState(roleName, scope) {
+  if (!ROLE_SCHEDULE_ENABLED || !roleName) {
+    return null;
+  }
+  try {
+    return (await roleSchedule.getState(roleName, { scope }))?.runtimeState || null;
+  } catch (error) {
+    // Conversation changes should never fail merely because an optional
+    // schedule refresh has a transient problem. The next normal message or
+    // scheduler tick will try to synchronize it again.
+    console.warn("切换会话时同步角色运行时状态失败:", error.message || error);
+    return null;
+  }
+}
+
+async function startRoleConversation(scope, role) {
+  const previousSession = await findActiveSession(scope);
+  clearConversationDebounceTimer(scope);
+  const discardedTaskCount = await discardPendingConversationTasks(scope, {
+    sessionId: previousSession?._id || null,
+    reason: "已通过 /newchat 切换角色会话",
+  });
+  if (previousSession?.roleName) {
+    await synchronizeRoleRuntimeState(previousSession.roleName, scope);
+  }
+  const session = await replaceActiveSession(scope, role);
+  const runtimeState = await synchronizeRoleRuntimeState(role.name, scope);
+  return {
+    session,
+    previousRoleName: previousSession?.roleName || "",
+    runtimeState,
+    discardedTaskCount,
+  };
+}
+
+async function endRoleConversation(scope) {
+  const session = await findActiveSession(scope);
+  clearConversationDebounceTimer(scope);
+  const discardedTaskCount = await discardPendingConversationTasks(scope, {
+    sessionId: session?._id || null,
+    reason: "已通过 /end 结束角色会话",
+  });
+  if (!session?.roleName) {
+    return { ended: false, discardedTaskCount, archivedMessageCount: 0 };
+  }
+  const runtimeState = await synchronizeRoleRuntimeState(session.roleName, scope);
+  const result = await endActiveSession(scope);
+  return {
+    ended: result.removedCount > 0,
+    roleName: session.roleName,
+    runtimeState,
+    discardedTaskCount,
+    archivedMessageCount: result.archivedMessageCount,
+  };
 }
 
 function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
@@ -6835,16 +6931,22 @@ function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
       .catch((error) => console.error("处理会话后台任务失败:", error))
       .finally(async () => {
         activeConversationTaskRuns.delete(key);
+        const session = await findActiveSession(scope);
+        if (!session?._id) {
+          return;
+        }
         const pending = await db.findOneAsync({
           type: "conversation-message-task",
           chatId: scope.chatId,
           userId: scope.userId,
+          sessionId: session._id,
           status: "pending",
         });
         const processing = pending && await db.findOneAsync({
           type: "conversation-message-task",
           chatId: scope.chatId,
           userId: scope.userId,
+          sessionId: session._id,
           status: "processing",
         });
         if (pending && !processing) {
@@ -6856,7 +6958,11 @@ function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
   conversationDebounceTimers.set(key, timer);
 }
 
-async function enqueueConversationMessage(ctx, scope, text) {
+async function enqueueConversationMessage(ctx, scope, text, session = null) {
+  const activeSession = session || await findActiveSession(scope);
+  if (!activeSession?._id) {
+    throw new Error("当前没有可写入的角色会话");
+  }
   const messageId = ctx.message?.message_id;
   if (messageId !== undefined) {
     const duplicate = await db.findOneAsync({
@@ -6875,6 +6981,7 @@ async function enqueueConversationMessage(ctx, scope, text) {
     type: "conversation-message-task",
     chatId: scope.chatId,
     userId: scope.userId,
+    sessionId: activeSession._id,
     telegramMessageId: messageId,
     text,
     status: "pending",
@@ -6902,7 +7009,7 @@ async function enqueueConversationMessage(ctx, scope, text) {
     throw error;
   }
   try {
-    await applyExplicitRuntimeLocationUpdate(scope, text);
+    await applyExplicitRuntimeLocationUpdate(scope, text, { sessionId: activeSession._id });
   } catch (error) {
     // The message itself is already safely queued. A state-recording failure
     // must not make Telegram retry it or make the user send it again.
@@ -6912,8 +7019,28 @@ async function enqueueConversationMessage(ctx, scope, text) {
   return task;
 }
 
+async function markConversationTasksDiscarded(taskIds, reason) {
+  if (!Array.isArray(taskIds) || taskIds.length === 0) {
+    return;
+  }
+  await db.updateAsync(
+    {
+      _id: { $in: taskIds },
+      status: { $in: ["pending", "processing"] },
+    },
+    {
+      $set: {
+        status: "discarded",
+        discardedAt: new Date().toISOString(),
+        discardReason: String(reason).slice(0, 160),
+      },
+    },
+    { multi: true },
+  );
+}
+
 async function processConversationTask(scope, { context = null, modelClient = openai } = {}) {
-  const pendingQuery = {
+  const pendingScopeQuery = {
     type: "conversation-message-task",
     chatId: scope.chatId,
     userId: scope.userId,
@@ -6923,10 +7050,36 @@ async function processConversationTask(scope, { context = null, modelClient = op
     const byTime = String(left.receivedAt).localeCompare(String(right.receivedAt));
     return byTime || Number(left.telegramMessageId || 0) - Number(right.telegramMessageId || 0);
   });
-  const pendingCandidates = sortTasks(await db.findAsync(pendingQuery));
+  const session = await findActiveSession(scope);
+  const pendingInScope = sortTasks(await db.findAsync(pendingScopeQuery));
+  if (pendingInScope.length === 0) {
+    return;
+  }
+  if (!session || !Array.isArray(session.messages) || session.messages.length === 0) {
+    await markConversationTasksDiscarded(
+      pendingInScope.map((task) => task._id),
+      "没有匹配的活动角色会话",
+    );
+    return;
+  }
+
+  // A Telegram message belongs to the exact session that was active when it
+  // arrived. Never let an old queued message bleed into a role selected by a
+  // later /newchat command. Legacy tasks without a session id are discarded
+  // for the same reason rather than guessed onto the current role.
+  const stalePendingTasks = pendingInScope.filter((task) => task.sessionId !== session._id);
+  await markConversationTasksDiscarded(
+    stalePendingTasks.map((task) => task._id),
+    "消息所属的角色会话已切换或结束",
+  );
+  const pendingCandidates = pendingInScope.filter((task) => task.sessionId === session._id);
   if (pendingCandidates.length === 0) {
     return;
   }
+  const pendingQuery = {
+    ...pendingScopeQuery,
+    sessionId: session._id,
+  };
 
   const claimUpdate = {
     $set: { status: "processing", startedAt: new Date().toISOString() },
@@ -6938,6 +7091,7 @@ async function processConversationTask(scope, { context = null, modelClient = op
         type: "conversation-message-task",
         chatId: scope.chatId,
         userId: scope.userId,
+        sessionId: session._id,
         status: "processing",
       },
     }));
@@ -6971,16 +7125,6 @@ async function processConversationTask(scope, { context = null, modelClient = op
   const taskIds = pendingTasks.map((task) => task._id);
 
   const ctx = context || createBackgroundContext({ chatId: scope.chatId, userId: scope.userId });
-  const session = await findActiveSession(scope);
-  if (!session || !Array.isArray(session.messages) || session.messages.length === 0) {
-    await db.updateAsync(
-      { _id: { $in: taskIds } },
-      { $set: { status: "discarded", completedAt: new Date().toISOString() } },
-      { multi: true },
-    );
-    return;
-  }
-
   const pendingUserMessages = pendingTasks.map((task) => ({ role: "user", content: task.text }));
   const modelHistory = getSessionMessagesForModel(session);
   const messages = [...modelHistory, ...pendingUserMessages];
@@ -7010,6 +7154,11 @@ async function processConversationTask(scope, { context = null, modelClient = op
       asmrEnabled,
     });
     const generatedMessages = result.messages.slice(messages.length);
+    const currentSession = await findActiveSession(scope);
+    if (!currentSession || currentSession._id !== session._id) {
+      await markConversationTasksDiscarded(taskIds, "生成期间角色会话已切换或结束");
+      return;
+    }
     await db.updateAsync(
       { _id: session._id, type: "chat-session" },
       {
@@ -7028,6 +7177,11 @@ async function processConversationTask(scope, { context = null, modelClient = op
       await replyWithText(ctx, result.answer);
     }
   } catch (error) {
+    const currentSession = await findActiveSession(scope);
+    if (!currentSession || currentSession._id !== session._id) {
+      await markConversationTasksDiscarded(taskIds, "生成失败前角色会话已切换或结束");
+      return;
+    }
     console.error("生成后台会话回复失败:", error);
     await db.updateAsync(
       { _id: { $in: taskIds } },
@@ -9094,9 +9248,22 @@ bot.command("newchat", async (ctx) => {
       return;
     }
 
-    await replaceActiveSession(scope, role);
+    const started = await startRoleConversation(scope, role);
+    const restoredMessageCount = Number(started.session.historyBaselineMessageCount) || 0;
+    const continuity = [
+      started.runtimeState
+        ? "角色当前实体状态已同步。"
+        : "角色日程未启用，已保留角色历史上下文。",
+      restoredMessageCount > 0
+        ? `已承接该角色最近 ${restoredMessageCount} 条历史上下文。`
+        : "该角色暂无可承接的历史上下文。",
+      started.discardedTaskCount > 0
+        ? `已取消 ${started.discardedTaskCount} 条尚未处理的旧消息，避免写入新会话。`
+        : "",
+    ].filter(Boolean).join("");
     await ctx.reply(
       `已开启与「${role.name}」的新对话。直接发送消息即可；发送 /end 结束本次对话。\n\n` +
+        `${continuity}\n\n` +
         "若管理员已开启“图片编辑”，可在私聊中上传参考图，并自然说明要让角色进图、换装、换场景、改背景或改画风；之后也能说“上一张再改成……”。若想让角色看图或识别 sticker，还需开启“看图”。开启“视频”后，也可以直接让角色制作一段短片。",
     );
   });
@@ -9155,14 +9322,13 @@ bot.command("end", async (ctx) => {
       await adminFlow.clear(scope);
     }
 
-    const removedCount = await db.removeAsync(
-      { type: "chat-session", ...scope },
-      { multi: true },
-    );
-
+    const ended = await endRoleConversation(scope);
     await ctx.reply(
-      removedCount > 0
-        ? "本次对话已结束，已清除该会话的上下文。"
+      ended.ended
+        ? `已结束与「${ended.roleName}」的本次对话。角色当前实体状态与历史上下文已保存；下次 /newchat ${ended.roleName} 会从同一角色的连续状态继续。` +
+          (ended.discardedTaskCount > 0
+            ? `\n已取消 ${ended.discardedTaskCount} 条尚未处理的旧消息。`
+            : "")
         : "当前没有进行中的对话。用 /list 选择角色后再开始吧。",
     );
   });
@@ -9212,7 +9378,7 @@ bot.help((ctx) => {
   const physicalStateHelp = "\n/state 查看角色当前的穿着、物品、身体和四肢状态";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始新对话\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、/mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
+    "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
       physicalStateHelp + adminHelp,
   );
 });
@@ -9261,7 +9427,7 @@ bot.on(message("text"), async (ctx) => {
   }
 
   try {
-    await enqueueConversationMessage(ctx, scope, text);
+    await enqueueConversationMessage(ctx, scope, text, session);
     void ctx.sendChatAction("typing").catch(() => undefined);
   } catch (error) {
     console.error("写入会话后台任务失败:", error);

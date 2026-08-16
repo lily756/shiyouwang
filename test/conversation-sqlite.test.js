@@ -257,12 +257,80 @@ test("processes a role conversation through SQLite and persists the assistant re
     const role = (await app.roleStore.getRoles()).find((item) => item.name === "测试角色");
     assert.ok(role);
 
+    const continuityScope = { chatId: 970000, userId: 970000 };
+    const firstContinuitySession = await app.replaceActiveSession(continuityScope, role);
+    await app.db.updateAsync(
+      { _id: firstContinuitySession._id },
+      {
+        $set: {
+          messages: [
+            { role: "system", content: role.systemPrompt },
+            { role: "user", content: "这是上一段对话。" },
+            { role: "assistant", content: "我记得这件事。" },
+            {
+              role: "assistant",
+              content: "这是一条不应带入模型的主动日程消息。",
+              metadata: { source: "role-schedule-proactive" },
+            },
+          ],
+        },
+      },
+    );
+    const restartedContinuitySession = await app.replaceActiveSession(continuityScope, role);
+    assert.equal(restartedContinuitySession.historyBaselineMessageCount, 2);
+    assert.deepEqual(
+      restartedContinuitySession.messages.map((message) => message.content),
+      [role.systemPrompt, "这是上一段对话。", "我记得这件事。"],
+    );
+    await app.db.updateAsync(
+      { _id: restartedContinuitySession._id },
+      {
+        $set: {
+          messages: [
+            ...restartedContinuitySession.messages,
+            { role: "user", content: "这是新的一段对话。" },
+            { role: "assistant", content: "我会继续保持连续性。" },
+          ],
+        },
+      },
+    );
+    const endedContinuitySession = await app.roleStore.endActiveSession(continuityScope);
+    assert.equal(endedContinuitySession.removedCount, 1);
+    assert.equal(endedContinuitySession.archivedMessageCount, 2);
+    assert.equal(await app.findActiveSession(continuityScope), null);
+    const resumedContinuitySession = await app.replaceActiveSession(continuityScope, role);
+    assert.equal(resumedContinuitySession.historyBaselineMessageCount, 4);
+    assert.deepEqual(
+      resumedContinuitySession.messages.map((message) => message.content),
+      [
+        role.systemPrompt,
+        "这是上一段对话。",
+        "我记得这件事。",
+        "这是新的一段对话。",
+        "我会继续保持连续性。",
+      ],
+    );
+    const storedRoleHistory = await app.roleStore.findRoleConversationHistory(
+      continuityScope,
+      role.name,
+    );
+    assert.deepEqual(
+      storedRoleHistory.messages.map((message) => message.content),
+      [
+        "这是上一段对话。",
+        "我记得这件事。",
+        "这是新的一段对话。",
+        "我会继续保持连续性。",
+      ],
+    );
+
     const scope = { chatId: 970001, userId: 970001 };
-    await app.replaceActiveSession(scope, role);
+    const activeSession = await app.replaceActiveSession(scope, role);
     const now = new Date().toISOString();
     await app.db.insertAsync({
       type: "conversation-message-task",
       ...scope,
+      sessionId: activeSession._id,
       telegramMessageId: 1,
       text: "你好，请确认 SQLite 对话链路正常。",
       status: "pending",
@@ -430,6 +498,40 @@ test("processes a role conversation through SQLite and persists the assistant re
     assert.equal(task.status, "completed");
     assert.deepEqual(session.messages.map((message) => message.role), ["system", "user", "assistant"]);
     assert.equal(session.messages.at(-1).content, "你好，测试角色已经收到你的消息，SQLite 对话链路正常。");
+
+    const staleScope = { chatId: 970002, userId: 970002 };
+    const staleSession = await app.replaceActiveSession(staleScope, role);
+    await app.replaceActiveSession(staleScope, role);
+    await app.db.insertAsync({
+      type: "conversation-message-task",
+      ...staleScope,
+      sessionId: staleSession._id,
+      telegramMessageId: 2,
+      text: "这条旧消息不能送到新的会话。",
+      status: "pending",
+      receivedAt: now,
+      createdAt: now,
+    });
+    let staleModelRequests = 0;
+    await app.processConversationTask(staleScope, {
+      modelClient: {
+        chat: {
+          completions: {
+            create: async () => {
+              staleModelRequests += 1;
+              throw new Error("旧会话消息不应请求模型");
+            },
+          },
+        },
+      },
+    });
+    const staleTask = await app.db.findOneAsync({
+      type: "conversation-message-task",
+      ...staleScope,
+      telegramMessageId: 2,
+    });
+    assert.equal(staleModelRequests, 0);
+    assert.equal(staleTask.status, "discarded");
   } finally {
     app?.db.close();
     for (const [name, value] of Object.entries(previousEnvironment)) {
