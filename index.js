@@ -2016,7 +2016,7 @@ function buildModelMessages(messages, runtimeContext = null) {
     content: [
       ...existingSystemMessages,
       toolInstruction.content,
-      runtimeInstruction,
+      "每轮请求都会在最新用户消息前注入一段临时实时状态；该状态优先于历史会话中的冲突叙事，且不会写入会话历史。",
     ].filter(Boolean).join("\n\n"),
   };
   const modelMessages = [systemMessage, ...conversationMessages];
@@ -2024,22 +2024,19 @@ function buildModelMessages(messages, runtimeContext = null) {
     return modelMessages;
   }
 
-  // Keep a short, fresh state anchor next to the current user turn. Some
-  // OpenAI-compatible providers pay more attention to the most recent
-  // instruction than to a second system message placed at the beginning.
+  // Keep the complete, changing state next to the current user turn. The
+  // stable system prefix remains cacheable while the state can change every
+  // minute without invalidating the whole prompt prefix.
   const latestUserIndex = modelMessages.findLastIndex(
     (messageRecord) => messageRecord?.role === "user",
   );
-  if (latestUserIndex <= 0) {
-    return modelMessages;
-  }
   const stateAnchor = {
     role: "system",
-    content: [
-      "本轮回复的实时状态复核：",
-      "以紧邻前文提供的实时状态为准；不要沿用与它冲突的旧电影、旧地点或旧动作。",
-    ].join("\n"),
+    content: `本轮临时实时状态（只对本轮回复生效，不写入会话历史）：\n${runtimeInstruction}`,
   };
+  if (latestUserIndex <= 0) {
+    return [...modelMessages, stateAnchor];
+  }
   return [
     ...modelMessages.slice(0, latestUserIndex),
     stateAnchor,

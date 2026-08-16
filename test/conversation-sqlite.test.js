@@ -52,13 +52,14 @@ test("processes a role conversation through SQLite and persists the assistant re
       },
     );
     assert.equal(modelMessages[0].role, "system");
-    assert.match(modelMessages[0].content, /唯一现实/);
-    assert.match(modelMessages[0].content, /主卧工作角/);
+    assert.doesNotMatch(modelMessages[0].content, /主卧工作角/);
     const latestUserIndex = modelMessages.findLastIndex((message) => message.role === "user");
     const anchorIndex = modelMessages.findIndex(
-      (message) => message.role === "system" && /实时状态复核/.test(message.content),
+      (message) => message.role === "system" && /本轮临时实时状态/.test(message.content),
     );
     assert.ok(anchorIndex > 0 && anchorIndex < latestUserIndex);
+    assert.match(modelMessages[anchorIndex].content, /唯一现实/);
+    assert.match(modelMessages[anchorIndex].content, /主卧工作角/);
 
     await app.db.ready;
     const role = (await app.roleStore.getRoles()).find((item) => item.name === "测试角色");
