@@ -41,6 +41,33 @@ test("processes a role conversation through SQLite and persists the assistant re
   let app = null;
   try {
     app = require("../index");
+    assert.equal(
+      app.getNewApiEndpoint("/images/generations", "https://hub.yongmuai.com"),
+      "https://hub.yongmuai.com/v1/images/generations",
+    );
+    assert.equal(
+      app.getNewApiEndpoint("images/edits", "https://hub.yongmuai.com/v1/"),
+      "https://hub.yongmuai.com/v1/images/edits",
+    );
+    assert.equal(app.getNewApiImageResponseFormat("GPT-Image-2"), "");
+    assert.equal(app.getNewApiImageResponseFormat("gemini-3.1-flash-image"), "url");
+    assert.deepEqual(
+      Object.fromEntries(
+        ["1:1", "3:4", "4:3", "9:16", "16:9"].map((ratio) => [
+          ratio,
+          app.getNewApiImageSizeForAspectRatio(ratio),
+        ]),
+      ),
+      {
+        "1:1": "1024x1024",
+        "3:4": "1152x1536",
+        "4:3": "1536x1152",
+        "9:16": "1024x1792",
+        "16:9": "1792x1024",
+      },
+    );
+    assert.equal(app.normalizeNewApiImageSize("1080x1920"), "1024x1792");
+    assert.equal(app.normalizeNewApiImageSize("1920x1080"), "1792x1024");
     const modelMessages = app.buildModelMessages(
       [
         { role: "system", content: "你是一个长期陪伴用户的角色。" },

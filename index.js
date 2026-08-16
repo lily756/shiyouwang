@@ -140,7 +140,7 @@ const NEWAPI_IMAGE_MODEL =
   process.env.NEWAPI_IMAGE_MODEL || "gemini-3.1-flash-image";
 const NEWAPI_IMAGE_EDIT_MODEL =
   process.env.NEWAPI_IMAGE_EDIT_MODEL || NEWAPI_IMAGE_MODEL;
-const NEWAPI_IMAGE_SIZE = process.env.NEWAPI_IMAGE_SIZE || "1080x1920";
+const NEWAPI_IMAGE_SIZE = process.env.NEWAPI_IMAGE_SIZE || "1024x1024";
 const NEWAPI_IMAGE_EDIT_SIZE = process.env.NEWAPI_IMAGE_EDIT_SIZE || "1024x1024";
 const IMAGE_ASPECT_RATIOS = Object.freeze(["1:1", "3:4", "4:3", "9:16", "16:9"]);
 const SEEDREAM_API_BASE_URL =
@@ -523,6 +523,36 @@ function getCommandArgument(ctx, command) {
 
 function isNewApiConfigured() {
   return Boolean(NEWAPI_BASE_URL && NEWAPI_API_KEY);
+}
+
+function getNewApiV1BaseUrl(baseUrl = NEWAPI_BASE_URL) {
+  const normalizedBaseUrl = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!normalizedBaseUrl) {
+    return "";
+  }
+  return /\/v1$/i.test(normalizedBaseUrl)
+    ? normalizedBaseUrl
+    : `${normalizedBaseUrl}/v1`;
+}
+
+function getNewApiEndpoint(resourcePath, baseUrl = NEWAPI_BASE_URL) {
+  const apiBaseUrl = getNewApiV1BaseUrl(baseUrl);
+  const normalizedPath = String(resourcePath || "").trim().replace(/^\/+/, "");
+  if (!apiBaseUrl || !normalizedPath) {
+    return apiBaseUrl;
+  }
+  return `${apiBaseUrl}/${normalizedPath}`;
+}
+
+function isNewApiGptImage2Model(model) {
+  return String(model || "").trim().toLowerCase() === "gpt-image-2";
+}
+
+function getNewApiImageResponseFormat(model) {
+  // YongmuAI's GPT-Image-2 endpoint returns b64_json by default, but rejects
+  // response_format altogether. Other OpenAI-compatible image models still
+  // use the established URL request form.
+  return isNewApiGptImage2Model(model) ? "" : "url";
 }
 
 function isSeedreamConfigured() {
@@ -2494,7 +2524,8 @@ async function requestNewApiCharacterImage(prompt, { aspectRatio = "" } = {}) {
     };
   }
 
-  const endpoint = `${NEWAPI_BASE_URL.replace(/\/+$/, "")}/images/generations/`;
+  const endpoint = getNewApiEndpoint("/images/generations");
+  const responseFormat = getNewApiImageResponseFormat(NEWAPI_IMAGE_MODEL);
 
   try {
     const response = await fetch(endpoint, {
@@ -2509,7 +2540,7 @@ async function requestNewApiCharacterImage(prompt, { aspectRatio = "" } = {}) {
         prompt: normalizedPrompt,
         size: getNewApiImageSizeForAspectRatio(aspectRatio),
         n: 1,
-        response_format: "url",
+        ...(responseFormat ? { response_format: responseFormat } : {}),
       }),
       signal: AbortSignal.timeout(180_000),
     });
@@ -2781,18 +2812,40 @@ function getSeedreamImageSizeForAspectRatio(aspectRatio) {
     : proSizes[normalized];
 }
 
+const NEWAPI_IMAGE_ASPECT_SIZES = Object.freeze({
+  "1:1": "1024x1024",
+  "3:4": "1152x1536",
+  "4:3": "1536x1152",
+  "9:16": "1024x1792",
+  "16:9": "1792x1024",
+});
+
+const NEWAPI_LEGACY_IMAGE_SIZE_ALIASES = Object.freeze({
+  "1080x1920": "1024x1792",
+  "1920x1080": "1792x1024",
+});
+
+function normalizeNewApiImageSize(size, fallback = "1024x1024") {
+  const normalizedSize = String(size || "").trim().toLowerCase();
+  if (!normalizedSize) {
+    return fallback;
+  }
+  return NEWAPI_LEGACY_IMAGE_SIZE_ALIASES[normalizedSize] || normalizedSize;
+}
+
 function getNewApiImageSizeForAspectRatio(aspectRatio) {
   const normalized = normalizeImageAspectRatio(aspectRatio);
   if (!normalized) {
-    return NEWAPI_IMAGE_SIZE;
+    return normalizeNewApiImageSize(NEWAPI_IMAGE_SIZE);
   }
-  return {
-    "1:1": "1536x1536",
-    "3:4": "1152x1536",
-    "4:3": "1536x1152",
-    "9:16": "1080x1920",
-    "16:9": "1920x1080",
-  }[normalized] || NEWAPI_IMAGE_SIZE;
+  return NEWAPI_IMAGE_ASPECT_SIZES[normalized]
+    || normalizeNewApiImageSize(NEWAPI_IMAGE_SIZE);
+}
+
+function getNewApiImageEditSizeForAspectRatio(aspectRatio) {
+  return normalizeImageAspectRatio(aspectRatio)
+    ? getNewApiImageSizeForAspectRatio(aspectRatio)
+    : normalizeNewApiImageSize(NEWAPI_IMAGE_EDIT_SIZE);
 }
 
 function buildReferenceImageEditPrompt({
@@ -2902,7 +2955,7 @@ async function requestNewApiReferenceImageEdit({
     return { ok: false, error: "NewAPI 图片编辑提示词不能超过 1000 个字符。" };
   }
 
-  const endpoint = `${NEWAPI_BASE_URL.replace(/\/+$/, "")}/images/edits`;
+  const endpoint = getNewApiEndpoint("/images/edits");
   const form = new FormData();
   const extension = normalizedMimeType === "image/png"
     ? "png"
@@ -2917,13 +2970,11 @@ async function requestNewApiReferenceImageEdit({
   form.set("prompt", editPrompt);
   form.set("model", NEWAPI_IMAGE_EDIT_MODEL);
   form.set("n", "1");
-  form.set(
-    "size",
-    normalizeImageAspectRatio(aspectRatio)
-      ? getNewApiImageSizeForAspectRatio(aspectRatio)
-      : NEWAPI_IMAGE_EDIT_SIZE,
-  );
-  form.set("response_format", "url");
+  form.set("size", getNewApiImageEditSizeForAspectRatio(aspectRatio));
+  const responseFormat = getNewApiImageResponseFormat(NEWAPI_IMAGE_EDIT_MODEL);
+  if (responseFormat) {
+    form.set("response_format", responseFormat);
+  }
 
   try {
     const response = await fetch(endpoint, {
@@ -9331,7 +9382,12 @@ module.exports = {
   executeToolCallsForRound,
   findActiveSession,
   filterCompletedStateUpdateTools,
+  getNewApiEndpoint,
+  getNewApiImageEditSizeForAspectRatio,
+  getNewApiImageResponseFormat,
+  getNewApiImageSizeForAspectRatio,
   getSessionMessagesForModel,
+  normalizeNewApiImageSize,
   parseExplicitRuntimeLocationUpdate,
   processConversationTask,
   replaceActiveSession,

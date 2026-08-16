@@ -182,12 +182,13 @@ SEEDREAM_MODEL=dola-seedream-5-0-pro-260628
 SEEDREAM_IMAGE_SIZE=2K
 
 # 可选兼容路径：仅 IMAGE_PROVIDER=newapi 时使用
-NEWAPI_BASE_URL=https://your-newapi-host/v1
+# 可填根域名或 /v1 路径；程序会自动规范为 /v1
+NEWAPI_BASE_URL=https://your-newapi-host
 NEWAPI_API_KEY=your_newapi_key
 # 可选；默认就是 gemini-3.1-flash-image
 NEWAPI_IMAGE_MODEL=gemini-3.1-flash-image
-# T2I 默认输出约 1080p 的竖图；可按模型能力调整
-NEWAPI_IMAGE_SIZE=1080x1920
+# T2I 默认输出尺寸；选择比例时会自动使用兼容尺寸
+NEWAPI_IMAGE_SIZE=1024x1024
 # I2I 使用 POST /v1/images/edits 的 multipart/form-data 格式
 NEWAPI_IMAGE_EDIT_MODEL=your_newapi_image_edit_model
 NEWAPI_IMAGE_EDIT_SIZE=1024x1024
