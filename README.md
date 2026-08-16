@@ -17,6 +17,7 @@ npm start
 - `/caffeine`：如果角色正在睡觉，让它在当前睡眠时段醒来并继续回复。
 - `/refreshprompt`（或 `/refresh`）：保留当前对话历史，仅重新载入当前角色最新的 system prompt。
 - `/export`：将当前对话的可见文本导出为 Markdown 文件；不会包含 system prompt、内部工具调用或工具返回。
+- `/clear`（或 `/clearhistory`）：永久清空当前角色在当前 Telegram 对话中的活动上下文和已归档历史，并立即开始空白新会话；不会清除角色日程、实体状态或图片记录。
 - `/end`：结束当前对话并归档该角色的历史上下文；下次用同一角色 `/newchat` 会从连续状态继续。
 - `/whoami`：显示自己的 Telegram 用户 ID，可用于配置管理员。
 

@@ -363,6 +363,24 @@ test("processes a role conversation through SQLite and persists the assistant re
         "我会继续保持连续性。",
       ],
     );
+    const clearedContinuitySession = await app.roleStore.clearRoleConversationHistory(
+      continuityScope,
+      role,
+      { sessionId: resumedContinuitySession._id },
+    );
+    assert.equal(clearedContinuitySession.ok, true);
+    assert.equal(clearedContinuitySession.clearedHistoryMessageCount, 4);
+    assert.equal(clearedContinuitySession.clearedSessionMessageCount, 4);
+    assert.equal(
+      await app.roleStore.findRoleConversationHistory(continuityScope, role.name),
+      null,
+    );
+    const emptyContinuitySession = await app.findActiveSession(continuityScope);
+    assert.equal(emptyContinuitySession._id, clearedContinuitySession.session._id);
+    assert.equal(emptyContinuitySession.historyBaselineMessageCount, 0);
+    assert.deepEqual(emptyContinuitySession.messages, [
+      { role: "system", content: role.systemPrompt },
+    ]);
 
     const scope = { chatId: 970001, userId: 970001 };
     const activeSession = await app.replaceActiveSession(scope, role);

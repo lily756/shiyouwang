@@ -436,6 +436,7 @@ const roleStore = createRoleStore({
   createConversationExportFilename,
 });
 const {
+  clearRoleConversationHistory,
   endActiveSession,
   exportActiveSession,
   findActiveSession,
@@ -6983,6 +6984,39 @@ async function endRoleConversation(scope) {
   };
 }
 
+async function clearCurrentRoleConversation(scope) {
+  const session = await findActiveSession(scope);
+  clearConversationDebounceTimer(scope);
+  const discardedTaskCount = await discardPendingConversationTasks(scope, {
+    sessionId: session?._id || null,
+    reason: "已通过 /clear 清空角色对话记录",
+  });
+  if (!session?.roleName) {
+    return { cleared: false, discardedTaskCount };
+  }
+
+  const role = findRole(await getRoles(), session.roleName);
+  if (!role) {
+    return {
+      cleared: false,
+      roleName: session.roleName,
+      discardedTaskCount,
+      error: `当前角色「${session.roleName}」已不存在，无法重建空白会话。`,
+    };
+  }
+  const result = await clearRoleConversationHistory(scope, role, { sessionId: session._id });
+  if (!result.ok) {
+    return { cleared: false, discardedTaskCount, error: result.error };
+  }
+  return {
+    cleared: true,
+    roleName: result.roleName,
+    discardedTaskCount,
+    clearedHistoryMessageCount: result.clearedHistoryMessageCount,
+    clearedSessionMessageCount: result.clearedSessionMessageCount,
+  };
+}
+
 function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
   const key = getConversationTaskKey(scope);
   if (activeConversationTaskRuns.has(key)) {
@@ -9335,7 +9369,7 @@ bot.command("newchat", async (ctx) => {
         : "",
     ].filter(Boolean).join("");
     await ctx.reply(
-      `已开启与「${role.name}」的新对话。直接发送消息即可；发送 /end 结束本次对话。\n\n` +
+      `已开启与「${role.name}」的新对话。直接发送消息即可；发送 /end 结束本次对话，或用 /clear 清空该角色的所有对话记录。\n\n` +
         `${continuity}\n\n` +
         "若管理员已开启“图片编辑”，可在私聊中上传参考图，并自然说明要让角色进图、换装、换场景、改背景或改画风；之后也能说“上一张再改成……”。若想让角色看图或识别 sticker，还需开启“看图”。开启“视频”后，也可以直接让角色制作一段短片。",
     );
@@ -9383,6 +9417,36 @@ bot.command("export", async (ctx) => {
     await exportActiveSession(ctx, scope);
   });
 });
+
+async function clearCurrentConversationCommand(ctx) {
+  const scope = getScope(ctx);
+  if (!scope) {
+    return;
+  }
+
+  await runInSessionQueue(scope, async () => {
+    if (isAdmin(ctx) && isPrivateChat(ctx)) {
+      await adminFlow.clear(scope);
+    }
+    const result = await clearCurrentRoleConversation(scope);
+    if (!result.cleared) {
+      await ctx.reply(
+        result.error || "当前没有进行中的角色对话。先用 /newchat 开始对话后再清空吧。",
+      );
+      return;
+    }
+    await ctx.reply(
+      `已清空与「${result.roleName}」的全部对话记录，并开始空白新会话。` +
+        "角色当前状态、日程和图片记录未受影响；已清空的对话不可恢复。" +
+        (result.discardedTaskCount > 0
+          ? `\n已取消 ${result.discardedTaskCount} 条尚未处理的旧消息。`
+          : ""),
+    );
+  });
+}
+
+bot.command("clear", clearCurrentConversationCommand);
+bot.command("clearhistory", clearCurrentConversationCommand);
 
 bot.command("end", async (ctx) => {
   const scope = getScope(ctx);
@@ -9451,7 +9515,7 @@ bot.help((ctx) => {
   const physicalStateHelp = "\n/state 查看角色当前的穿着、物品、身体和四肢状态";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
+    "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/clear 或 /clearhistory 清空当前角色的全部对话记录（保留角色状态、日程与图片；不可恢复）\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
       physicalStateHelp + adminHelp,
   );
 });
