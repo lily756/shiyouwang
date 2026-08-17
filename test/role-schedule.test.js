@@ -39,6 +39,106 @@ test("normalizes minute schedule entries and fills uncovered time", () => {
   assert.equal(buildFallbackSchedule().some((entry) => entry.kind === "sleep"), true);
 });
 
+test("coalesces adjacent generic free-time fragments", () => {
+  const entries = normalizeScheduleEntries({
+    entries: [
+      { start: "00:00", end: "08:00", kind: "sleep", activity: "睡觉", location: "家" },
+      { start: "08:00", end: "08:01", kind: "rest", activity: "自由安排 / 休息", environment: "按当天情况自然变化", location: "家", proactive: false },
+      { start: "08:01", end: "08:02", kind: "rest", activity: "自由安排 / 休息", environment: "按当天情况自然变化", location: "家", proactive: false },
+      { start: "08:02", end: "08:03", kind: "rest", activity: "自由安排 / 休息", environment: "按当天情况自然变化", location: "家", proactive: false },
+      { start: "08:03", end: "24:00", kind: "sleep", activity: "睡觉", location: "家" },
+    ],
+  });
+
+  const fillerEntries = entries.filter((entry) => entry.activity === "自由安排 / 休息");
+  assert.equal(fillerEntries.length, 1);
+  assert.equal(fillerEntries[0].startMinute, 480);
+  assert.equal(fillerEntries[0].endMinute, 483);
+  assert.equal(fillerEntries[0].proactive, false);
+});
+
+test("replaces a stored schedule with an oversized synthetic free-time tail", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const dateKey = "2026-08-04";
+  await db.insertAsync({
+    type: "role-daily-schedule",
+    scheduleVersion: SCHEDULE_VERSION,
+    roleName: role.name,
+    roleNameKey: role.name.toLocaleLowerCase(),
+    dateKey,
+    timezone: "UTC",
+    dailySeed: 123,
+    dailySeedVersion: DAILY_SEED_VERSION,
+    source: "model",
+    entries: [
+      { startMinute: 0, endMinute: 480, kind: "sleep", activity: "睡觉", environment: "卧室", location: "家", mood: "平静", proactive: false },
+      { startMinute: 480, endMinute: 481, kind: "routine", activity: "出门", environment: "玄关", location: "家", mood: "清醒", proactive: false },
+      { startMinute: 481, endMinute: 482, kind: "rest", activity: "自由安排 / 休息", environment: "按当天情况自然变化", location: "家", mood: "放松", proactive: false },
+      { startMinute: 482, endMinute: 483, kind: "rest", activity: "自由安排 / 休息", environment: "按当天情况自然变化", location: "家", mood: "放松", proactive: false },
+      { startMinute: 483, endMinute: 1440, kind: "rest", activity: "自由安排 / 休息", environment: "按当天情况自然变化", location: "家", mood: "放松", proactive: false },
+    ],
+    createdAt: "2026-08-04T00:00:00.000Z",
+    updatedAt: "2026-08-04T00:00:00.000Z",
+  });
+  let generated = 0;
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => {
+      generated += 1;
+      return {
+        entries: [
+          { start: "00:00", end: "08:00", kind: "sleep", activity: "夜间睡眠", location: "家" },
+          { start: "08:00", end: "12:00", kind: "work", activity: "工作", location: "工作室" },
+          { start: "12:00", end: "13:00", kind: "meal", activity: "午饭", location: "工作室" },
+          { start: "13:00", end: "22:00", kind: "creative", activity: "创作", location: "工作室" },
+          { start: "22:00", end: "24:00", kind: "sleep", activity: "入睡", location: "家" },
+        ],
+      };
+    },
+    logger: { warn() {} },
+  });
+
+  const schedule = await manager.ensureDailySchedule(
+    role,
+    new Date("2026-08-04T10:00:00.000Z"),
+  );
+  assert.equal(generated, 1);
+  assert.equal(schedule.source, "model");
+  assert.equal(schedule.entries.some((entry) => entry.activity === "创作"), true);
+  assert.equal(schedule.entries.at(-1).endMinute, 1440);
+  assert.equal(schedule.entries.at(-1).activity, "入睡");
+});
+
+test("uses the seeded plan instead of truncating excessive model fragments", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const fragments = Array.from({ length: 97 }, (_, index) => ({
+    startMinute: index,
+    endMinute: index + 1,
+    kind: "routine",
+    activity: `碎片活动-${index}`,
+    location: "家",
+  }));
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({ entries: fragments }),
+    logger: { warn() {} },
+  });
+
+  const schedule = await manager.ensureDailySchedule(
+    role,
+    new Date("2026-08-04T10:00:00.000Z"),
+  );
+  assert.equal(schedule.source, "seeded");
+  assert.equal(schedule.entries.some((entry) => entry.activity === "碎片活动-0"), false);
+  assert.equal(schedule.entries.at(-1).endMinute, 1440);
+});
+
 test("reserves preparation and travel time between explicitly different locations", () => {
   const entries = normalizeScheduleEntries({
     entries: [
