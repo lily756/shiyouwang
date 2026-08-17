@@ -585,6 +585,26 @@ function parseRoleProactivePreferenceArgument(argument) {
   return { action: "invalid" };
 }
 
+function parseRolePlanHorizon(argument) {
+  const value = String(argument || "").trim().toLocaleLowerCase();
+  if (!value || ["all", "全部", "总览", "overview"].includes(value)) {
+    return "all";
+  }
+  if (["today", "day", "今天", "当天"].includes(value)) {
+    return "today";
+  }
+  if (["tomorrow", "next", "明天", "次日"].includes(value)) {
+    return "tomorrow";
+  }
+  if (["week", "weekly", "本周", "周"].includes(value)) {
+    return "week";
+  }
+  if (["long", "longterm", "长期", "长期计划"].includes(value)) {
+    return "long";
+  }
+  return "";
+}
+
 function isNewApiConfigured() {
   return Boolean(NEWAPI_BASE_URL && NEWAPI_API_KEY);
 }
@@ -1700,20 +1720,51 @@ async function generateThreeSceneWithModel({ role, prompt, animationPrompt, role
   }
 }
 
-async function generateRoleScheduleWithModel({ role, dateKey, timezone, seed, seedKey }) {
+function buildRoleSchedulePlanningPrompt(planning, dateKey = "") {
+  if (!planning?.longTermPlan || !planning?.weeklyPlan || !planning?.dayPlan) {
+    return "当前没有额外的分层计划；请按角色设定安排完整的一天。";
+  }
+  const goals = (planning.longTermPlan.goals || [])
+    .filter((goal) => goal?.status !== "completed")
+    .slice(0, 5)
+    .map((goal) => `- ${goal.id}：${goal.title}（优先级 ${goal.priority}，进度 ${goal.progress}%）`)
+    .join("\n");
+  const weeklyFocus = (planning.weeklyPlan.dailyFocus || [])
+    .map((item) => `- ${item.dateKey}：${item.title}${item.goalId ? `（goalId=${item.goalId}）` : ""}`)
+    .join("\n");
+  const commitments = (planning.weeklyPlan.commitments || [])
+    .filter((item) => item?.dateKey === dateKey)
+    .map((item) => `- ${String(Math.floor(item.startMinute / 60)).padStart(2, "0")}:${String(item.startMinute % 60).padStart(2, "0")}-${String(Math.floor(item.endMinute / 60)).padStart(2, "0")}:${String(item.endMinute % 60).padStart(2, "0")} ${item.activity} @${item.location}${item.goalId ? `（goalId=${item.goalId}）` : ""}`)
+    .join("\n");
+  const dayOutline = (planning.dayPlan.entries || [])
+    .map((entry) => `- ${String(Math.floor(entry.startMinute / 60)).padStart(2, "0")}:${String(entry.startMinute % 60).padStart(2, "0")}-${String(Math.floor(entry.endMinute / 60)).padStart(2, "0")}:${String(entry.endMinute % 60).padStart(2, "0")} ${entry.activity} @${entry.location}${entry.goalId ? `（goalId=${entry.goalId}）` : ""}${entry.commitmentId ? `（commitmentId=${entry.commitmentId}）` : ""}`)
+    .join("\n");
+  return [
+    "长期目标：",
+    goals || "- 保持角色自己的长期生活主线。",
+    "本周重点：",
+    weeklyFocus || "- 根据长期目标安排本周节奏。",
+    commitments ? `今天不可丢失的周内安排：\n${commitments}` : "",
+    "今天的粗粒度提纲（必须将其扩展成完整分钟日程，允许为真实交通插入 prepare/commute，但不能丢掉高优先级活动）：",
+    dayOutline,
+  ].filter(Boolean).join("\n");
+}
+
+async function generateRoleScheduleWithModel({ role, dateKey, timezone, seed, seedKey, planning = null }) {
   if (!canGenerateRoleScheduleWithModel()) {
     return null;
   }
 
   const systemPrompt = [
     "你是角色日程编排器。你要为一个长期生活在现实世界中的聊天角色安排今天的完整日程。",
+    "系统会给出长期目标、本周重点和今天的粗粒度提纲。它们是同一角色的连续生活计划：你要把今天提纲展开成分钟级日程，不能把它当成一次性灵感，也不能用与之冲突的活动替换高优先级安排。",
     "日程必须覆盖当天 00:00 到 24:00，时间边界精确到分钟；活动之间不要重叠。这里的“精确到分钟”只表示起止时间使用分钟，不是要求每分钟单独生成一条活动。",
     `本日日程随机种子：${Number.isFinite(Number(seed)) ? Number(seed) >>> 0 : "未提供"}（${seedKey || "role-daily-plan"}）。请用它决定今天活动的细节和时间变化；同一角色、同一日期、同一种子重算时，应尽量保持相同的作息骨架。`,
     "请根据角色设定安排有生活感但不过分戏剧化的活动，必须包含合理的睡眠时段，也可以包含吃饭、休息、工作、学习、运动、通勤或创作。正常情况下使用 8 到 24 条有意义的日程；禁止把同一活动、地点或空档拆成连续的一分钟条目。只有同一住宅/办公室内的一次步行 commute 可以是 1 分钟，且不能连续重复。",
     "每一条都必须填写稳定的 location（地点名）和该地点内的 environment（具体环境）；environment 不能代替 location。",
     "只要相邻的两个主要活动 location 不同，就必须在前一个活动结束、后一个活动开始之前安排连续的 prepare 和 commute 条目，不能瞬移。prepare 要留出换衣服、穿鞋、拿钥匙/手机/钱包/包等出门准备时间；commute 要写清交通方式或路况并留出真实的交通分钟数，commute 结束才算到达。",
     "prepare 的 kind 固定为 prepare，commute 的 kind 固定为 commute；prepare/commute 的 proactive 必须为 false，也不要把它们写成可 roll 的主要行为。若时间不够容纳准备和交通，就缩短其他活动或不要安排跨地点活动。",
-    "只输出 JSON，不要 Markdown、解释或额外文字。格式必须是 {\"entries\":[{\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"kind\":\"sleep|meal|rest|work|study|exercise|routine|creative|social|prepare|commute\",\"activity\":\"...\",\"location\":\"...\",\"destination\":\"...\",\"environment\":\"...\",\"mood\":\"...\",\"preparationMinutes\":15,\"travelMinutes\":20,\"proactive\":true|false,\"physicalState\":{\"outfit\":\"...\",\"heldItems\":[\"...\"],\"internalDevices\":[\"...\"],\"bodyState\":\"...\",\"limbStates\":{\"leftArm\":\"...\",\"rightArm\":\"...\",\"leftLeg\":\"...\",\"rightLeg\":\"...\"}}}]}；destination、preparationMinutes、travelMinutes 只在需要时填写。",
+    "只输出 JSON，不要 Markdown、解释或额外文字。格式必须是 {\"entries\":[{\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"kind\":\"sleep|meal|rest|work|study|exercise|routine|creative|social|prepare|commute\",\"activity\":\"...\",\"location\":\"...\",\"destination\":\"...\",\"environment\":\"...\",\"mood\":\"...\",\"goalId\":\"...\",\"commitmentId\":\"...\",\"preparationMinutes\":15,\"travelMinutes\":20,\"proactive\":true|false,\"physicalState\":{\"outfit\":\"...\",\"heldItems\":[\"...\"],\"internalDevices\":[\"...\"],\"bodyState\":\"...\",\"limbStates\":{\"leftArm\":\"...\",\"rightArm\":\"...\",\"leftLeg\":\"...\",\"rightLeg\":\"...\"}}}]}；destination、preparationMinutes、travelMinutes 只在需要时填写。若提纲条目给了 goalId 或 commitmentId，请在对应展开活动中原样保留；prepare/commute 不需要填写它们。",
     "physicalState 是角色的连续性状态账本：outfit=穿着，heldItems=当前手持物品数组，internalDevices=身体内部装置数组，bodyState=身体整体状态，limbStates=四肢或手脚状态；carriedItems 仍可作为随身物品数组。字段省略表示沿用上一条，数组为空或文本为 null 才表示明确清空。除非 prepare 阶段或活动明确导致变化，否则必须原样沿用，不要每条活动随机换装、换手持物品、添加/移除装置、改变身体状态或四肢状态。",
     "睡觉或午睡的 kind 必须是 sleep 或 nap；吃饭的 kind 必须是 meal；只有短暂休息、用餐或有明确生活瞬间且适合偶尔分享时才把 proactive 设为 true，连续数小时的自由休息、睡前放松和时间填充应设为 false；prepare 和 commute 必须为 false。",
   ].join("\n");
@@ -1723,6 +1774,7 @@ async function generateRoleScheduleWithModel({ role, dateKey, timezone, seed, se
     `角色名称：${role.name}`,
     `角色简介：${role.description}`,
     `角色设定：\n${String(role.systemPrompt || "").slice(0, 6_000)}`,
+    `分层生活计划：\n${buildRoleSchedulePlanningPrompt(planning, dateKey)}`,
     "请安排一份有明确分钟边界的日程。",
   ].join("\n\n");
 
@@ -9171,6 +9223,44 @@ bot.command("schedule", async (ctx) => {
   }
 });
 
+bot.command("plan", async (ctx) => {
+  const scope = getScope(ctx);
+  if (!scope) {
+    return;
+  }
+  const session = await findActiveSession(scope);
+  if (!session?.roleName) {
+    await ctx.reply("当前没有进行中的角色对话。先用 /newchat 开始对话吧。");
+    return;
+  }
+  const horizon = parseRolePlanHorizon(getCommandArgument(ctx, "plan"));
+  if (!horizon) {
+    await ctx.reply("用法：/plan [today|tomorrow|week|long]\n例如：/plan today、/plan tomorrow、/plan week、/plan long。省略参数可查看总览。");
+    return;
+  }
+  try {
+    const overview = await roleSchedule.getPlanningOverview(session.roleName);
+    if (!overview) {
+      await ctx.reply("角色的分层计划暂时还没有生成出来，稍后再试试。");
+      return;
+    }
+    const labels = {
+      all: "分层计划总览",
+      today: "当天提纲",
+      tomorrow: "次日提纲",
+      week: "本周计划",
+      long: "长期主线",
+    };
+    await replyWithText(
+      ctx,
+      `「${session.roleName}」${labels[horizon]}：\n\n${roleSchedule.formatPlanningOverview(overview, horizon)}`,
+    );
+  } catch (error) {
+    console.error("读取角色分层计划失败:", error);
+    await ctx.reply("角色的分层计划暂时没读出来，稍后再试试。 ");
+  }
+});
+
 bot.command("proactive", async (ctx) => {
   const scope = getScope(ctx);
   if (!scope) {
@@ -9828,7 +9918,7 @@ async function resetCurrentRoleCommand(ctx) {
       return;
     }
     await ctx.reply(
-      `已将「${result.roleName}」从零重置：对话历史、实体/运行时、六维情感和身体状态已清空，` +
+      `已将「${result.roleName}」从零重置：对话历史、实体/运行时、六维情感、身体状态和分层计划已清空，` +
         `并以新随机种子 ${result.dailySeed} 重制了今天的分钟日程。现在是空白新会话。` +
         (result.discardedTaskCount > 0
           ? `\n已取消 ${result.discardedTaskCount} 条尚未处理的旧消息。`
@@ -9907,7 +9997,7 @@ bot.help((ctx) => {
   const proactiveHelp = "\n/proactive off|low|normal|high|<分钟> 调整当前角色主动消息频率";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/clear 或 /clearhistory 清空当前角色的全部对话记录（保留角色状态、日程与图片；不可恢复）\n/reset 管理员私聊从零重置当前角色：清空历史和角色状态，重制今天的分钟日程\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
+    "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/clear 或 /clearhistory 清空当前角色的全部对话记录（保留角色状态、日程与图片；不可恢复）\n/reset 管理员私聊从零重置当前角色：清空历史、角色状态和分层计划，重制今天的分钟日程\n/schedule 查看角色今天的分钟日程\n/plan [today|tomorrow|week|long] 查看当天、次日、本周或长期计划\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
       physicalStateHelp + proactiveHelp + adminHelp,
   );
 });

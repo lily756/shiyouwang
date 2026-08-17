@@ -3,10 +3,13 @@ const assert = require("node:assert/strict");
 const Datastore = require("@seald-io/nedb");
 const {
   buildFallbackSchedule,
+  DAY_PLAN_RECORD_TYPE,
   buildSeededSchedule,
   buildPhysicalStateChanges,
   createRoleScheduleManager,
   DAILY_SEED_VERSION,
+  LONG_TERM_PLAN_RECORD_TYPE,
+  PLANNING_VERSION,
   getDailyScheduleSeed,
   isBehaviorEntry,
   isIdleEntry,
@@ -20,6 +23,7 @@ const {
   ROLE_RUNTIME_OVERRIDE_RECORD_TYPE,
   ROLE_STATE_RECORD_TYPE,
   SCHEDULE_VERSION,
+  WEEKLY_PLAN_RECORD_TYPE,
 } = require("../lib/role-schedule");
 
 test("normalizes minute schedule entries and fills uncovered time", () => {
@@ -290,6 +294,118 @@ test("stores and forwards the daily seed when generating a schedule", async () =
   assert.equal(generationInput.seed, expectedSeed);
   assert.equal(typeof generationInput.seedKey, "string");
   assert.equal(typeof generationInput.random, "function");
+});
+
+test("persists long, weekly, and next-day plans before materializing a daily schedule", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = {
+    name: "小雨",
+    description: "喜欢写作，也会规律散步的自由职业者",
+    systemPrompt: "你是小雨，会认真经营自己的生活。",
+  };
+  let generationInput = null;
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async (input) => {
+      generationInput = input;
+      return {
+        entries: [
+          { start: "00:00", end: "08:00", kind: "sleep", activity: "睡觉", location: "家" },
+          { start: "08:00", end: "12:00", kind: "creative", activity: "推进创作", location: "家" },
+          { start: "12:00", end: "13:00", kind: "meal", activity: "午饭", location: "家" },
+          { start: "13:00", end: "24:00", kind: "rest", activity: "休息", location: "家" },
+        ],
+      };
+    },
+    logger: { warn() {} },
+  });
+  const at = new Date("2026-08-04T10:00:00.000Z");
+
+  const overview = await manager.getPlanningOverview(role.name, at);
+  assert.equal(overview.longTermPlan.planningVersion, PLANNING_VERSION);
+  assert.equal(overview.weeklyPlan.weekKey, "2026-08-03");
+  assert.equal(overview.dayPlan.dateKey, "2026-08-04");
+  assert.equal(overview.tomorrowPlan.dateKey, "2026-08-05");
+  assert.equal(overview.longTermPlan.goals.length >= 3, true);
+  assert.equal(overview.dayPlan.entries[0].startMinute, 0);
+  assert.equal(overview.dayPlan.entries.at(-1).endMinute, 1440);
+  assert.equal((await db.findAsync({ type: LONG_TERM_PLAN_RECORD_TYPE })).length, 1);
+  assert.equal((await db.findAsync({ type: WEEKLY_PLAN_RECORD_TYPE })).length, 1);
+  assert.equal((await db.findAsync({ type: DAY_PLAN_RECORD_TYPE })).length, 2);
+
+  const schedule = await manager.ensureDailySchedule(role, at);
+  assert.equal(schedule.planningVersion, PLANNING_VERSION);
+  assert.equal(generationInput.planning.dayPlan.dateKey, "2026-08-04");
+  assert.equal(generationInput.planning.weeklyPlan.weekKey, "2026-08-03");
+  const state = await manager.getState(role.name, { at });
+  assert.match(manager.buildRuntimeContextFromState(state), /角色分层生活计划/);
+  assert.match(manager.buildRuntimeContextFromState(state), /明天预定重点/);
+});
+
+test("seeded daily fallback unfolds the persisted day plan rather than discarding its focus", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "喜欢学习", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    logger: { warn() {} },
+  });
+  const at = new Date("2026-08-04T10:00:00.000Z");
+  const overview = await manager.getPlanningOverview(role.name, at);
+  const storedDayPlan = await db.findOneAsync({
+    type: DAY_PLAN_RECORD_TYPE,
+    roleNameKey: role.name.toLocaleLowerCase(),
+    dateKey: overview.dateKey,
+  });
+  const entries = storedDayPlan.entries.map((entry) => (
+    entry.id.includes("morning-focus")
+      ? {
+          ...entry,
+          kind: "study",
+          activity: "参加固定的摄影课并完成练习",
+          location: "社区教室",
+          environment: "靠窗的课程桌",
+          goalId: "goal-primary",
+        }
+      : entry
+  ));
+  await db.updateAsync({ _id: storedDayPlan._id }, { $set: { entries, updatedAt: "2026-08-04T00:00:00.000Z" } });
+
+  const schedule = await manager.ensureDailySchedule(role, at);
+  const plannedEntry = schedule.entries.find((entry) => entry.activity === "参加固定的摄影课并完成练习");
+  assert.equal(schedule.source, "seeded");
+  assert.ok(plannedEntry);
+  assert.equal(plannedEntry.goalId, "goal-primary");
+  assert.equal(schedule.entries.every((entry, index) => index === 0 || entry.startMinute === schedule.entries[index - 1].endMinute), true);
+});
+
+test("completed scheduled work feeds back into the weekly record and long-term goal progress", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "自由职业写作者", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    random: () => 0,
+    logger: { warn() {} },
+  });
+  const at = new Date("2026-08-04T10:00:00.000Z");
+  const before = await manager.getPlanningOverview(role.name, at);
+  const primaryGoal = before.longTermPlan.goals.find((goal) => goal.priority === 1);
+  const beforeProgress = primaryGoal.progress;
+
+  const outcome = await manager.processBehavior(role, at);
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.planningGoalId, primaryGoal.id);
+  assert.ok(outcome.planningFeedbackAppliedAt);
+
+  const after = await manager.getPlanningOverview(role.name, at);
+  const updatedGoal = after.longTermPlan.goals.find((goal) => goal.id === primaryGoal.id);
+  assert.equal(updatedGoal.progress, beforeProgress + 1);
+  assert.equal(after.weeklyPlan.outcomes.some((item) => item.status === "completed"), true);
 });
 
 test("resets all role state and regenerates today's schedule with a fresh seed", async () => {
