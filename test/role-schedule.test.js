@@ -190,6 +190,86 @@ test("stores and forwards the daily seed when generating a schedule", async () =
   assert.equal(typeof generationInput.random, "function");
 });
 
+test("resets all role state and regenerates today's schedule with a fresh seed", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "安静的角色", systemPrompt: "你是小雨。" };
+  const generationSeeds = [];
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    random: () => 0.25,
+    generateSchedule: async ({ seed }) => {
+      generationSeeds.push(seed);
+      return {
+        entries: [
+          { start: "00:00", end: "12:00", kind: "sleep", activity: `睡觉-${seed}`, location: "家" },
+          { start: "12:00", end: "24:00", kind: "rest", activity: `休息-${seed}`, location: "家" },
+        ],
+      };
+    },
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 801, userId: 802 };
+  const otherScope = { chatId: 803, userId: 804 };
+  const at = new Date("2026-08-04T01:00:00.000Z");
+  const initial = await manager.getState(role.name, { scope, at });
+  await manager.getState(role.name, { scope: otherScope, at });
+  await manager.wakeWithCaffeine(role.name, scope, at);
+  await manager.updatePhysicalState(
+    role.name,
+    scope,
+    { outfit: "黑色外出服", internalDevices: ["义眼"] },
+    { at, reason: "测试持久实体状态" },
+  );
+  await manager.updateRuntimeState(
+    role.name,
+    scope,
+    { location: "咖啡馆", activity: "和朋友聊天", environment: "窗边座位" },
+    { at, reason: "测试运行时覆盖" },
+  );
+  await db.insertAsync({
+    type: "role-behavior-outcome",
+    roleName: role.name,
+    roleNameKey: role.name.toLocaleLowerCase(),
+    dateKey: "2026-08-04",
+    entryStartMinute: 720,
+    status: "rescheduled",
+    retryPlan: { targetDateKey: "2026-08-05", targetMinute: 720 },
+  });
+  await db.insertAsync({
+    type: "role-schedule-proactive",
+    chatId: scope.chatId,
+    userId: scope.userId,
+    roleName: role.name,
+    roleNameKey: role.name.toLocaleLowerCase(),
+    dateKey: "2026-08-04",
+    entryStartMinute: 0,
+    status: "sent",
+  });
+
+  const reset = await manager.resetRoleStateAndSchedule(role.name, { scope, at });
+
+  assert.equal(reset.ok, true);
+  assert.notEqual(reset.dailySeed, initial.schedule.dailySeed);
+  assert.equal(generationSeeds.length, 2);
+  assert.equal(generationSeeds.at(-1), reset.dailySeed);
+  assert.equal(reset.schedule.dailySeed, reset.dailySeed);
+  assert.equal(reset.state.runtimeState.manualOverride, false);
+  assert.equal(reset.state.runtimeState.physicalState.outfit, undefined);
+  assert.equal(reset.state.runtimeState.physicalState.internalDevices, undefined);
+  assert.equal(reset.state.caffeineOverride, false);
+  assert.equal((await db.findAsync({ type: ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE })).length, 0);
+  assert.equal((await db.findAsync({ type: ROLE_RUNTIME_OVERRIDE_RECORD_TYPE })).length, 0);
+  assert.equal((await db.findAsync({ type: "role-caffeine-override" })).length, 0);
+  assert.equal((await db.findAsync({ type: "role-behavior-outcome" })).length, 0);
+  assert.equal((await db.findAsync({ type: "role-schedule-proactive" })).length, 0);
+  const runtimeStates = await db.findAsync({ type: ROLE_STATE_RECORD_TYPE });
+  assert.equal(runtimeStates.length, 1);
+  assert.equal(runtimeStates[0].chatId, scope.chatId);
+  assert.equal(runtimeStates[0].userId, scope.userId);
+});
+
 test("normalizes and merges physical continuity state without inventing changes", () => {
   const entries = normalizeScheduleEntries({
     entries: [

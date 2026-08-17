@@ -7017,6 +7017,60 @@ async function clearCurrentRoleConversation(scope) {
   };
 }
 
+async function resetCurrentRoleFromScratch(scope) {
+  const session = await findActiveSession(scope);
+  clearConversationDebounceTimer(scope);
+  const discardedTaskCount = await discardPendingConversationTasks(scope, {
+    sessionId: session?._id || null,
+    reason: "已通过 /reset 从零重置角色会话",
+  });
+  if (!session?.roleName) {
+    return { reset: false, discardedTaskCount };
+  }
+  if (!ROLE_SCHEDULE_ENABLED) {
+    return {
+      reset: false,
+      discardedTaskCount,
+      error: "角色日程功能当前未启用，无法执行从零重置。",
+    };
+  }
+
+  const role = findRole(await getRoles(), session.roleName);
+  if (!role) {
+    return {
+      reset: false,
+      discardedTaskCount,
+      error: `当前角色「${session.roleName}」已不存在，无法从零重置。`,
+    };
+  }
+  const scheduleReset = await roleSchedule.resetRoleStateAndSchedule(role.name, { scope });
+  if (!scheduleReset.ok) {
+    return {
+      reset: false,
+      discardedTaskCount,
+      error: scheduleReset.error || "重置角色状态和日程失败。",
+    };
+  }
+  const conversationReset = await clearRoleConversationHistory(scope, role, {
+    sessionId: session._id,
+  });
+  if (!conversationReset.ok) {
+    return {
+      reset: false,
+      discardedTaskCount,
+      error: conversationReset.error || "角色日程已重置，但无法创建空白新会话。",
+    };
+  }
+  return {
+    reset: true,
+    roleName: role.name,
+    dailySeed: scheduleReset.dailySeed,
+    discardedTaskCount,
+    clearedHistoryMessageCount: conversationReset.clearedHistoryMessageCount,
+    clearedSessionMessageCount: conversationReset.clearedSessionMessageCount,
+  };
+}
+
 function scheduleConversationTask(scope, delayMs = CONVERSATION_DEBOUNCE_MS) {
   const key = getConversationTaskKey(scope);
   if (activeConversationTaskRuns.has(key)) {
@@ -9448,6 +9502,37 @@ async function clearCurrentConversationCommand(ctx) {
 bot.command("clear", clearCurrentConversationCommand);
 bot.command("clearhistory", clearCurrentConversationCommand);
 
+async function resetCurrentRoleCommand(ctx) {
+  if (!isAdmin(ctx) || !isPrivateChat(ctx)) {
+    await ctx.reply("从零重置会影响该角色的全局状态和今日日程，仅管理员可在私聊中使用 /reset。");
+    return;
+  }
+  const scope = getScope(ctx);
+  if (!scope) {
+    return;
+  }
+
+  await runInSessionQueue(scope, async () => {
+    await adminFlow.clear(scope);
+    const result = await resetCurrentRoleFromScratch(scope);
+    if (!result.reset) {
+      await ctx.reply(
+        result.error || "当前没有进行中的角色对话。先用 /newchat 开始对话后再重置吧。",
+      );
+      return;
+    }
+    await ctx.reply(
+      `已将「${result.roleName}」从零重置：对话历史、实体/运行时状态已清空，` +
+        `并以新随机种子 ${result.dailySeed} 重制了今天的分钟日程。现在是空白新会话。` +
+        (result.discardedTaskCount > 0
+          ? `\n已取消 ${result.discardedTaskCount} 条尚未处理的旧消息。`
+          : ""),
+    );
+  });
+}
+
+bot.command("reset", resetCurrentRoleCommand);
+
 bot.command("end", async (ctx) => {
   const scope = getScope(ctx);
   if (!scope) {
@@ -9515,7 +9600,7 @@ bot.help((ctx) => {
   const physicalStateHelp = "\n/state 查看角色当前的穿着、物品、身体和四肢状态";
 
   return ctx.reply(
-    "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/clear 或 /clearhistory 清空当前角色的全部对话记录（保留角色状态、日程与图片；不可恢复）\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
+    "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/clear 或 /clearhistory 清空当前角色的全部对话记录（保留角色状态、日程与图片；不可恢复）\n/reset 管理员私聊从零重置当前角色：清空历史和角色状态，重制今天的分钟日程\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
       physicalStateHelp + adminHelp,
   );
 });
