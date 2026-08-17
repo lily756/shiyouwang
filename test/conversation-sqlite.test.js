@@ -457,6 +457,57 @@ test("processes a role conversation through SQLite and persists the assistant re
     assert.equal(coalescedStateResults[0].stateUpdateCoalesced, true);
     assert.equal(coalescedStateResults[0].mergedIntoToolCallId, "state-update-2");
 
+    const repeatedAffectiveCalls = [
+      {
+        id: "affective-update-1",
+        type: "function",
+        function: {
+          name: "update_role_affective_state",
+          arguments: JSON.stringify({
+            short_term_delta: { valence: -4, stress: 5 },
+            body_delta: { fatigue: 6 },
+            condition: "感冒恢复期",
+            reason: "用户明确说角色有点不舒服",
+          }),
+        },
+      },
+      {
+        id: "affective-update-2",
+        type: "function",
+        function: {
+          name: "update_role_affective_state",
+          arguments: JSON.stringify({
+            short_term_delta: { valence: -3, trust: 2 },
+            body_delta: { fatigue: 4, pain: 5 },
+            symptoms: ["咳嗽"],
+            reason: "用户继续安慰角色",
+          }),
+        },
+      },
+    ];
+    const executedAffectiveCalls = [];
+    const coalescedAffectiveResults = await app.executeToolCallsForRound(
+      context,
+      repeatedAffectiveCalls,
+      {
+        executeToolCallFn: async (_ctx, toolCall) => {
+          executedAffectiveCalls.push(toolCall);
+          return { ok: true, affectiveStateUpdated: true };
+        },
+      },
+    );
+    assert.equal(executedAffectiveCalls.length, 1);
+    assert.equal(executedAffectiveCalls[0].id, "affective-update-2");
+    assert.deepEqual(JSON.parse(executedAffectiveCalls[0].function.arguments), {
+      short_term_delta: { valence: -7, stress: 5, trust: 2 },
+      body_delta: { fatigue: 10, pain: 5 },
+      condition: "感冒恢复期",
+      symptoms: ["咳嗽"],
+      reason: "用户继续安慰角色",
+    });
+    assert.equal(coalescedAffectiveResults[0].stateUpdateCoalesced, true);
+    assert.equal(coalescedAffectiveResults[0].mergedIntoToolCallId, "affective-update-2");
+
     const stateUpdateRequests = [];
     const stateUpdateResult = await app.runModelWithTools(
       context,

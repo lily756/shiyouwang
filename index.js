@@ -37,6 +37,8 @@ const {
 } = require("./lib/minimax-anthropic");
 const {
   createRoleScheduleManager,
+  formatBodyCondition,
+  formatEmotionVector,
   normalizePhysicalState,
 } = require("./lib/role-schedule");
 const {
@@ -115,6 +117,7 @@ const MAX_TOOL_ROUNDS = 4;
 const STATE_UPDATE_TOOL_NAMES = new Set([
   "update_role_physical_state",
   "update_role_runtime_state",
+  "update_role_affective_state",
 ]);
 const MCD_AUTO_LOAD_ENABLED = !["false", "0", "no", "off"].includes(
   String(process.env.MCD_AUTO_LOAD_ENABLED || "true").trim().toLowerCase(),
@@ -360,7 +363,7 @@ const TOOL_USE_SYSTEM_PROMPT = [
   VIDEO_LOCATION_GUARD_ENABLED
     ? "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，它们是角色此刻的连续性事实。普通回复和视频必须延续这些事实；不要因为用户刚提到另一个场景就让角色瞬间移动、换装或凭空改变道具。图片 Function 的 prompt/instruction 不得自动带入这些 state 字段；必要的移动状态由服务器单独校验。用户明确要求未来场景时，应先说明需要准备和移动，除非当前日程状态已经到达，否则不要直接生成那个未来场景。"
     : "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，普通回复仍应尽量保持连续；图片 Function 的 prompt/instruction 不得自动带入这些 state 字段。视频地点状态校验已关闭，用户明确要求的视频地点和场景优先，不因当前地点、移动状态或日程同步异常拒绝视频工具。",
-  "如果用户明确说角色已经换衣、拿起或放下物品、安装或移除身体内部装置，或身体/四肢状态已经发生变化，先调用 update_role_physical_state 记录现实变化，再继续回复或生成媒体；如果用户明确说角色已经到达、回到、来到、移动到某个地点，或当前正在做什么/处于什么环境已经改变，先调用 update_role_runtime_state 记录实际地点和场景。若同一轮还要生成图片/视频，所有状态更新必须先于媒体工具。用户只是提出想象中的未来画面、写作设定或媒体 prompt 时，不要把它当成现实状态更新。",
+  "如果用户明确说角色已经换衣、拿起或放下物品、安装或移除身体内部装置，或姿势、可见身体/四肢状态已经发生变化，先调用 update_role_physical_state 记录现实变化，再继续回复或生成媒体；如果用户明确说角色已经到达、回到、来到、移动到某个地点，或当前正在做什么/处于什么环境已经改变，先调用 update_role_runtime_state 记录实际地点和场景。若用户的明确言行造成了显著的当下情绪、关系，或健康、病症、疲劳、困倦、疼痛变化，调用 update_role_affective_state：短期情绪可以适度变化，长期关系只在明确且有持续意义的事件中小幅变化；身体状态只能记录明确事实，不能自行诊断或凭空宣称生病/痊愈。若同一轮还要生成图片/视频，所有状态更新必须先于媒体工具。用户只是提出想象中的未来画面、写作设定或媒体 prompt 时，不要把它当成现实状态更新。",
   "当用户明确要求角色用声音朗读、说出来、发语音或试听角色声音时，调用 generate_character_audio；工具结果标记 audioQueued 后只说明正在准备音频，完成后会单独发送，不能假称音频已生成。若运行时 ASMR/助眠语音模式已开启，不要手动传普通 voice_id，让工具自动使用当前角色的 ASMR 音色；语气和 text 也要更轻、更慢、更适合睡前聆听。",
   MEDIA_PROMPT_MODE === "guided"
     ? "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会直接附带已保存的人设图来锁定角色的面部、发型和参考图原生视觉风格。绝不预设为 2D、动漫或写实：人设图是什么风格，结果就保持什么风格。只有用户明确要求纯风景、纯物品、纯食物或画面中不要人物/角色时，才能设为 false；不要因为提示词没有重复角色名就设为 false。"
@@ -986,7 +989,7 @@ function getToolDefinitions(
     function: {
       name: "update_role_physical_state",
       description:
-        "记录当前角色已经发生的实体状态变化，并让后续文字、图片、视频和 3D 场景保持一致。只有用户明确说角色穿上/脱下衣物、拿起/放下物品、装上/移除身体装置，或明确说明身体/四肢状态变化时才使用；不要因为媒体画面里的临时想象或单纯描述用户愿望而调用。此工具只更新当前角色会话的连续状态，不修改角色设定图。",
+        "记录当前角色已经发生的可见实体状态变化，并让后续文字、图片、视频和 3D 场景保持一致。只有用户明确说角色穿上/脱下衣物、拿起/放下物品、装上/移除身体装置，或明确说明姿势、四肢、外观身体状态变化时才使用；健康、病症、疲劳、困倦和疼痛应使用 update_role_affective_state 记录。不要因为媒体画面里的临时想象或单纯描述用户愿望而调用。此工具只更新当前角色会话的连续状态，不修改角色设定图。",
       parameters: {
         type: "object",
         properties: {
@@ -1008,7 +1011,7 @@ function getToolDefinitions(
           },
           body_state: {
             anyOf: [{ type: "string" }, { type: "null" }],
-            description: "身体整体状态，例如精神正常、疲惫、发烧；不要自行诊断。传 null 表示清空特别状态。",
+            description: "可见或动作相关的身体整体状态，例如“淋雨后衣服湿了”“刚运动完在擦汗”；健康、病症、疲劳、困倦和疼痛请改用 update_role_affective_state。不要自行诊断。传 null 表示清空特别状态。",
           },
           limb_states: {
             anyOf: [
@@ -1063,6 +1066,72 @@ function getToolDefinitions(
           reason: {
             type: "string",
             description: "一句简短的现实变化依据，例如‘用户明确说已经瞬移到家里’。",
+          },
+        },
+        required: ["reason"],
+        additionalProperties: false,
+      },
+    },
+  });
+
+  tools.push({
+    type: "function",
+    function: {
+      name: "update_role_affective_state",
+      description:
+        "记录角色相对当前用户的六维情绪/情感和结构化身体状态。仅当用户的明确言行已经造成了可确认的现实变化时调用；短期情绪用于眼前反应，长期情感只用于明确且持续的关系事件，变化必须克制。身体字段只能记录用户明确说明或角色已发生的事实，绝不能自行诊断、虚构疾病或把想象中的画面写入状态。",
+      parameters: {
+        type: "object",
+        properties: {
+          short_term_delta: {
+            type: "object",
+            description: "当前短期情绪的增减，范围 -45 到 45；六维分别为愉悦、唤醒、亲近、信任、安全感、压力。只填写实际变化的维度。",
+            properties: {
+              valence: { type: "number", minimum: -45, maximum: 45 },
+              arousal: { type: "number", minimum: -45, maximum: 45 },
+              closeness: { type: "number", minimum: -45, maximum: 45 },
+              trust: { type: "number", minimum: -45, maximum: 45 },
+              security: { type: "number", minimum: -45, maximum: 45 },
+              stress: { type: "number", minimum: -45, maximum: 45 },
+            },
+            additionalProperties: false,
+          },
+          long_term_delta: {
+            type: "object",
+            description: "长期关系基线的增减，范围 -12 到 12；只在明确且有持续意义的事件中小幅填写。",
+            properties: {
+              valence: { type: "number", minimum: -12, maximum: 12 },
+              arousal: { type: "number", minimum: -12, maximum: 12 },
+              closeness: { type: "number", minimum: -12, maximum: 12 },
+              trust: { type: "number", minimum: -12, maximum: 12 },
+              security: { type: "number", minimum: -12, maximum: 12 },
+              stress: { type: "number", minimum: -12, maximum: 12 },
+            },
+            additionalProperties: false,
+          },
+          body_delta: {
+            type: "object",
+            description: "身体数值的增减，范围 -50 到 50。health 越高越健康；illness/fatigue/sleepiness/pain 越高越明显。只记录已经明确发生的变化。",
+            properties: {
+              health: { type: "number", minimum: -50, maximum: 50 },
+              illness: { type: "number", minimum: -50, maximum: 50 },
+              fatigue: { type: "number", minimum: -50, maximum: 50 },
+              sleepiness: { type: "number", minimum: -50, maximum: 50 },
+              pain: { type: "number", minimum: -50, maximum: 50 },
+            },
+            additionalProperties: false,
+          },
+          condition: {
+            anyOf: [{ type: "string" }, { type: "null" }],
+            description: "可选的明确身体状态文字，例如“感冒恢复期”；传 null 表示已明确恢复并清除文字状态。不要诊断。",
+          },
+          symptoms: {
+            anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }],
+            description: "可选的已明确症状完整列表；传 [] 或 null 表示明确无症状。",
+          },
+          reason: {
+            type: "string",
+            description: "一句简短、可追溯的变化依据，例如“用户连续安慰角色，角色当下明显放松”。",
           },
         },
         required: ["reason"],
@@ -1683,6 +1752,9 @@ async function generateRoleProactiveText({ role, state }) {
     `当前活动：${state.current.activity}`,
     `当前环境：${state.current.environment}`,
     `当前情绪/精力：${state.current.mood}`,
+    `短期六维情绪：${formatEmotionVector(state.affectiveState?.shortTerm)}`,
+    `长期六维情感：${formatEmotionVector(state.affectiveState?.longTerm)}`,
+    `身体状态：${formatBodyCondition(state.affectiveState?.body)}`,
     state.pendingBehaviorRetries?.[0]
       ? `待补做行为：${state.pendingBehaviorRetries[0].activity}，计划${state.pendingBehaviorRetries[0].retryPlan?.label || "稍后"}补做`
       : "",
@@ -2346,14 +2418,38 @@ function mergeStateUpdateArguments(toolName, argumentValues) {
   const merged = {};
   const fieldNames = toolName === "update_role_physical_state"
     ? ["outfit", "carried_items", "held_items", "internal_devices", "body_state", "limb_states"]
-    : ["location", "destination", "activity", "environment", "mood"];
+    : toolName === "update_role_affective_state"
+      ? ["short_term_delta", "long_term_delta", "body_delta", "condition", "symptoms"]
+      : ["location", "destination", "activity", "environment", "mood"];
   for (const args of argumentValues) {
     for (const fieldName of fieldNames) {
       if (!Object.prototype.hasOwnProperty.call(args, fieldName)) {
         continue;
       }
       const value = args[fieldName];
-      if (
+      if (toolName === "update_role_affective_state" && [
+        "short_term_delta",
+        "long_term_delta",
+        "body_delta",
+      ].includes(fieldName)) {
+        const previous = merged[fieldName]
+          && typeof merged[fieldName] === "object"
+          && !Array.isArray(merged[fieldName])
+          ? merged[fieldName]
+          : {};
+        const next = { ...previous };
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          for (const [key, delta] of Object.entries(value)) {
+            const amount = Number(delta);
+            if (!Number.isFinite(amount)) {
+              continue;
+            }
+            const priorAmount = Number(next[key]);
+            next[key] = (Number.isFinite(priorAmount) ? priorAmount : 0) + amount;
+          }
+        }
+        merged[fieldName] = next;
+      } else if (
         toolName === "update_role_physical_state"
         && fieldName === "limb_states"
         && value
@@ -5717,6 +5813,41 @@ async function executeToolCall(
     };
   }
 
+  if (toolCall.function.name === "update_role_affective_state") {
+    const scope = getScope(ctx);
+    const session = scope ? await findActiveSession(scope) : null;
+    if (!scope || !session?.roleName) {
+      return { ok: false, error: "请先用 /newchat 开启角色对话，再记录角色情感或身体状态。" };
+    }
+    const updates = {
+      shortTermDelta: args.short_term_delta,
+      longTermDelta: args.long_term_delta,
+      bodyDelta: args.body_delta,
+    };
+    if (Object.prototype.hasOwnProperty.call(args, "condition")) {
+      updates.condition = args.condition;
+    }
+    if (Object.prototype.hasOwnProperty.call(args, "symptoms")) {
+      updates.symptoms = args.symptoms;
+    }
+    const result = await roleSchedule.updateAffectiveState(
+      session.roleName,
+      scope,
+      updates,
+      { reason: args.reason, at: new Date() },
+    );
+    if (!result.ok) {
+      return result;
+    }
+    return {
+      ok: true,
+      affectiveStateUpdated: true,
+      roleName: session.roleName,
+      updates: result.updates,
+      message: "六维情感和身体状态已记录。本轮不要再次调用 update_role_affective_state，继续完成对用户的回复。",
+    };
+  }
+
   if (toolCall.function.name === "generate_character_3d_scene") {
     if (!settings.threeDEnabled) {
       return { ok: false, error: "3D 模型与骨骼动画功能已被管理员关闭。" };
@@ -8952,7 +9083,10 @@ bot.command("state", async (ctx) => {
       `「${session.roleName}」当前实体状态：\n\n` +
         `活动：${runtime.activity || state.current.activity}${runtime.manualOverride ? "（已按当前对话更新）" : ""}\n` +
         `地点：${runtime.location || "未记录"}\n` +
-        `${formatRolePhysicalState(runtime)}`,
+        `${formatRolePhysicalState(runtime)}` +
+        `\n\n短期六维情绪：${formatEmotionVector(state.affectiveState?.shortTerm)}\n` +
+        `长期六维情感：${formatEmotionVector(state.affectiveState?.longTerm)}\n` +
+        `身体状态：${formatBodyCondition(state.affectiveState?.body)}`,
     );
   } catch (error) {
     console.error("读取角色实体状态失败:", error);
@@ -9522,7 +9656,7 @@ async function resetCurrentRoleCommand(ctx) {
       return;
     }
     await ctx.reply(
-      `已将「${result.roleName}」从零重置：对话历史、实体/运行时状态已清空，` +
+      `已将「${result.roleName}」从零重置：对话历史、实体/运行时、六维情感和身体状态已清空，` +
         `并以新随机种子 ${result.dailySeed} 重制了今天的分钟日程。现在是空白新会话。` +
         (result.discardedTaskCount > 0
           ? `\n已取消 ${result.discardedTaskCount} 条尚未处理的旧消息。`
@@ -9597,7 +9731,7 @@ bot.help((ctx) => {
   const adminHelp = isAdmin(ctx)
     ? "\n/admin 角色管理（仅限私聊）\n/cancel 退出角色管理"
     : "";
-  const physicalStateHelp = "\n/state 查看角色当前的穿着、物品、身体和四肢状态";
+  const physicalStateHelp = "\n/state 查看角色当前的实体状态、六维短/长期情感及健康、病症、疲劳、困倦状态";
 
   return ctx.reply(
     "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/clear 或 /clearhistory 清空当前角色的全部对话记录（保留角色状态、日程与图片；不可恢复）\n/reset 管理员私聊从零重置当前角色：清空历史和角色状态，重制今天的分钟日程\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +

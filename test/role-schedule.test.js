@@ -14,6 +14,7 @@ const {
   mergePhysicalState,
   normalizeScheduleEntries,
   normalizePhysicalState,
+  ROLE_AFFECTIVE_STATE_RECORD_TYPE,
   ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE,
   ROLE_RUNTIME_OVERRIDE_RECORD_TYPE,
   ROLE_STATE_RECORD_TYPE,
@@ -228,6 +229,18 @@ test("resets all role state and regenerates today's schedule with a fresh seed",
     { location: "咖啡馆", activity: "和朋友聊天", environment: "窗边座位" },
     { at, reason: "测试运行时覆盖" },
   );
+  await manager.updateAffectiveState(
+    role.name,
+    scope,
+    {
+      shortTermDelta: { valence: -20, stress: 25 },
+      longTermDelta: { trust: 6 },
+      bodyDelta: { illness: 30, fatigue: 25 },
+      condition: "感冒恢复期",
+      symptoms: ["咳嗽"],
+    },
+    { at, reason: "测试情感和身体状态" },
+  );
   await db.insertAsync({
     type: "role-behavior-outcome",
     roleName: role.name,
@@ -261,6 +274,7 @@ test("resets all role state and regenerates today's schedule with a fresh seed",
   assert.equal(reset.state.caffeineOverride, false);
   assert.equal((await db.findAsync({ type: ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE })).length, 0);
   assert.equal((await db.findAsync({ type: ROLE_RUNTIME_OVERRIDE_RECORD_TYPE })).length, 0);
+  assert.equal((await db.findAsync({ type: ROLE_AFFECTIVE_STATE_RECORD_TYPE })).length, 0);
   assert.equal((await db.findAsync({ type: "role-caffeine-override" })).length, 0);
   assert.equal((await db.findAsync({ type: "role-behavior-outcome" })).length, 0);
   assert.equal((await db.findAsync({ type: "role-schedule-proactive" })).length, 0);
@@ -268,6 +282,72 @@ test("resets all role state and regenerates today's schedule with a fresh seed",
   assert.equal(runtimeStates.length, 1);
   assert.equal(runtimeStates[0].chatId, scope.chatId);
   assert.equal(runtimeStates[0].userId, scope.userId);
+});
+
+test("persists six-dimensional affect, lets short-term emotion cool down, and tracks body condition", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "安静的角色", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "12:00", kind: "sleep", activity: "睡觉", location: "家" },
+        { start: "12:00", end: "24:00", kind: "rest", activity: "休息", location: "家" },
+      ],
+    }),
+    logger: { warn() {} },
+  });
+  const scope = { chatId: 901, userId: 902 };
+  const at = new Date("2026-08-05T12:00:00.000Z");
+
+  const initial = await manager.getState(role.name, { scope, at });
+  assert.equal(initial.affectiveState.shortTerm.valence, 55);
+  assert.equal(initial.affectiveState.longTerm.trust, 45);
+
+  const updated = await manager.updateAffectiveState(
+    role.name,
+    scope,
+    {
+      shortTermDelta: { valence: -30, stress: 35, arousal: 15 },
+      longTermDelta: { trust: 8, closeness: 5 },
+      bodyDelta: { health: -15, illness: 30, fatigue: 35, sleepiness: 20, pain: 15 },
+      condition: "感冒恢复期",
+      symptoms: ["咳嗽", "鼻塞"],
+    },
+    { at, reason: "角色明确表示不舒服，但得到安慰" },
+  );
+
+  assert.equal(updated.ok, true);
+  assert.equal(updated.affectiveState.shortTerm.valence, 25);
+  assert.equal(updated.affectiveState.shortTerm.stress, 60);
+  assert.equal(updated.affectiveState.longTerm.trust, 53);
+  assert.equal(updated.affectiveState.longTerm.closeness, 40);
+  assert.equal(updated.affectiveState.body.health, 70);
+  assert.equal(updated.affectiveState.body.illness, 30);
+  assert.equal(updated.affectiveState.body.fatigue, 60);
+  assert.equal(updated.affectiveState.body.sleepiness, 45);
+  assert.equal(updated.affectiveState.body.pain, 15);
+  assert.equal(updated.affectiveState.body.condition, "感冒恢复期");
+  assert.deepEqual(updated.affectiveState.body.symptoms, ["咳嗽", "鼻塞"]);
+
+  const sixHoursLater = await manager.getState(role.name, {
+    scope,
+    at: new Date("2026-08-05T18:00:00.000Z"),
+  });
+  assert.equal(sixHoursLater.affectiveState.longTerm.trust, 53);
+  assert.equal(sixHoursLater.affectiveState.longTerm.closeness, 40);
+  assert.equal(sixHoursLater.affectiveState.shortTerm.valence > 25, true);
+  assert.equal(sixHoursLater.affectiveState.shortTerm.valence < 55, true);
+  assert.equal(sixHoursLater.affectiveState.shortTerm.stress < 60, true);
+  assert.equal(sixHoursLater.affectiveState.shortTerm.stress > 25, true);
+  assert.equal(sixHoursLater.affectiveState.body.illness < 30, true);
+  assert.equal(sixHoursLater.affectiveState.body.illness > 0, true);
+  assert.equal(sixHoursLater.affectiveState.body.condition, "感冒恢复期");
+  assert.deepEqual(sixHoursLater.affectiveState.body.symptoms, ["咳嗽", "鼻塞"]);
+  assert.match(manager.buildRuntimeContextFromState(sixHoursLater), /短期六维情绪/);
+  assert.match(manager.buildRuntimeContextFromState(sixHoursLater), /结构化身体状态/);
 });
 
 test("normalizes and merges physical continuity state without inventing changes", () => {
