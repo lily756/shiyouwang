@@ -16,6 +16,7 @@ const {
   normalizePhysicalState,
   ROLE_AFFECTIVE_STATE_RECORD_TYPE,
   ROLE_PHYSICAL_STATE_EVENT_RECORD_TYPE,
+  ROLE_PROACTIVE_PREFERENCE_RECORD_TYPE,
   ROLE_RUNTIME_OVERRIDE_RECORD_TYPE,
   ROLE_STATE_RECORD_TYPE,
   SCHEDULE_VERSION,
@@ -1006,6 +1007,181 @@ test("only sends proactive messages during idle entries and applies cooldown", a
   assert.equal(second.sent, false);
   assert.equal(afterCooldown.sent, false);
   assert.deepEqual(sent, ["吃饭"]);
+});
+
+test("persists per-user proactive preferences and honors a custom interval", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const sent = [];
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "12:00", kind: "work", activity: "工作", location: "工作室" },
+        { start: "12:00", end: "14:00", kind: "meal", activity: "吃饭", location: "工作室" },
+        { start: "14:00", end: "24:00", kind: "work", activity: "工作", location: "工作室" },
+      ],
+    }),
+    proactiveProbability: 1,
+    proactiveCooldownMs: 0,
+    random: () => 0,
+    sendProactive: async ({ session }) => {
+      sent.push(`${session.chatId}:${session.userId}`);
+    },
+    logger: { warn() {} },
+  });
+  const session = { type: "chat-session", chatId: 310, userId: 320, roleName: role.name };
+  const scope = { chatId: session.chatId, userId: session.userId };
+
+  const disabled = await manager.setProactivePreference(
+    role.name,
+    scope,
+    { mode: "off" },
+  );
+  assert.equal(disabled.ok, true);
+  const blocked = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:00:00.000Z"),
+  );
+  assert.equal(blocked.sent, false);
+  assert.equal(blocked.reason, "disabled-by-user");
+
+  const custom = await manager.setProactivePreference(
+    role.name,
+    scope,
+    { mode: "custom", intervalMinutes: 30 },
+  );
+  assert.equal(custom.ok, true);
+  assert.equal(custom.preference.intervalMinutes, 30);
+
+  const first = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:29:00.000Z"),
+  );
+  const duringCooldown = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:31:00.000Z"),
+  );
+  const afterInterval = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T13:00:00.000Z"),
+  );
+  assert.equal(first.sent, true);
+  assert.equal(duringCooldown.sent, false);
+  assert.equal(duringCooldown.reason, "cooldown");
+  assert.equal(afterInterval.sent, true);
+  assert.deepEqual(sent, ["310:320", "310:320"]);
+
+  const [storedPreference] = await db.findAsync({
+    type: ROLE_PROACTIVE_PREFERENCE_RECORD_TYPE,
+    chatId: scope.chatId,
+    userId: scope.userId,
+  });
+  assert.equal(storedPreference.mode, "custom");
+  assert.equal(storedPreference.intervalMinutes, 30);
+  const otherPreference = await manager.getProactivePreference(role.name, {
+    chatId: 311,
+    userId: 321,
+  });
+  assert.equal(otherPreference.mode, "normal");
+  assert.equal(otherPreference.source, "default");
+});
+
+test("keeps the server proactive switch authoritative over user preferences", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "12:00", kind: "work", activity: "工作", location: "工作室" },
+        { start: "12:00", end: "14:00", kind: "meal", activity: "吃饭", location: "工作室" },
+        { start: "14:00", end: "24:00", kind: "work", activity: "工作", location: "工作室" },
+      ],
+    }),
+    proactiveProbability: 0,
+    random: () => 0,
+    sendProactive: async () => {
+      throw new Error("全局关闭时不应发送主动消息");
+    },
+    logger: { warn() {} },
+  });
+  const session = { type: "chat-session", chatId: 410, userId: 420, roleName: role.name };
+  const preference = await manager.setProactivePreference(
+    role.name,
+    { chatId: session.chatId, userId: session.userId },
+    { mode: "custom", intervalMinutes: 5 },
+  );
+
+  assert.equal(preference.ok, true);
+  assert.equal(preference.policy.enabled, false);
+  const result = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:00:00.000Z"),
+  );
+  assert.equal(result.sent, false);
+  assert.equal(result.reason, "disabled-by-server");
+});
+
+test("does not overlap custom proactive sends across interval boundaries", async () => {
+  const db = new Datastore({ inMemoryOnly: true });
+  const role = { name: "小雨", description: "", systemPrompt: "你是小雨。" };
+  let releaseSend;
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const sendFinished = new Promise((resolve) => {
+    releaseSend = resolve;
+  });
+  let sentCount = 0;
+  const manager = createRoleScheduleManager({
+    db,
+    getRoles: async () => [role],
+    timezone: "UTC",
+    generateSchedule: async () => ({
+      entries: [
+        { start: "00:00", end: "12:00", kind: "work", activity: "工作", location: "工作室" },
+        { start: "12:00", end: "14:00", kind: "meal", activity: "吃饭", location: "工作室" },
+        { start: "14:00", end: "24:00", kind: "work", activity: "工作", location: "工作室" },
+      ],
+    }),
+    proactiveProbability: 1,
+    random: () => 0,
+    sendProactive: async () => {
+      sentCount += 1;
+      markStarted();
+      await sendFinished;
+    },
+    logger: { warn() {} },
+  });
+  const session = { type: "chat-session", chatId: 510, userId: 520, roleName: role.name };
+  await manager.setProactivePreference(
+    role.name,
+    { chatId: session.chatId, userId: session.userId },
+    { mode: "custom", intervalMinutes: 5 },
+  );
+
+  const firstPromise = manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:04:59.000Z"),
+  );
+  await started;
+  const second = await manager.maybeSendProactive(
+    session,
+    new Date("2026-08-04T12:05:01.000Z"),
+  );
+  releaseSend();
+  const first = await firstPromise;
+
+  assert.equal(first.sent, true);
+  assert.equal(second.sent, false);
+  assert.equal(second.reason, "cooldown");
+  assert.equal(sentCount, 1);
 });
 
 test("honors proactive false and ignores filler rest entries", () => {

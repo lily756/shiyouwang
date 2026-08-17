@@ -364,6 +364,7 @@ const TOOL_USE_SYSTEM_PROMPT = [
     ? "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，它们是角色此刻的连续性事实。普通回复和视频必须延续这些事实；不要因为用户刚提到另一个场景就让角色瞬间移动、换装或凭空改变道具。图片 Function 的 prompt/instruction 不得自动带入这些 state 字段；必要的移动状态由服务器单独校验。用户明确要求未来场景时，应先说明需要准备和移动，除非当前日程状态已经到达，否则不要直接生成那个未来场景。"
     : "如果运行时状态提供了当前地点、环境、活动、穿着、随身物品、手持物品、身体内部装置、身体状态或四肢状态，普通回复仍应尽量保持连续；图片 Function 的 prompt/instruction 不得自动带入这些 state 字段。视频地点状态校验已关闭，用户明确要求的视频地点和场景优先，不因当前地点、移动状态或日程同步异常拒绝视频工具。",
   "如果用户明确说角色已经换衣、拿起或放下物品、安装或移除身体内部装置，或姿势、可见身体/四肢状态已经发生变化，先调用 update_role_physical_state 记录现实变化，再继续回复或生成媒体；如果用户明确说角色已经到达、回到、来到、移动到某个地点，或当前正在做什么/处于什么环境已经改变，先调用 update_role_runtime_state 记录实际地点和场景。若用户的明确言行造成了显著的当下情绪、关系，或健康、病症、疲劳、困倦、疼痛变化，调用 update_role_affective_state：短期情绪可以适度变化，长期关系只在明确且有持续意义的事件中小幅变化；身体状态只能记录明确事实，不能自行诊断或凭空宣称生病/痊愈。若同一轮还要生成图片/视频，所有状态更新必须先于媒体工具。用户只是提出想象中的未来画面、写作设定或媒体 prompt 时，不要把它当成现实状态更新。",
+  "当用户明确要求角色主动发消息更频繁、更少、关闭主动消息，或指定“每隔多少分钟”时，调用 set_role_proactive_frequency 保存该用户当前角色的偏好。只有明确要求频率时才调用；主动消息仍只会在角色空闲、吃饭或休息时段发送，不会在睡眠、通勤或忙碌时打扰。",
   "当用户明确要求角色用声音朗读、说出来、发语音或试听角色声音时，调用 generate_character_audio；工具结果标记 audioQueued 后只说明正在准备音频，完成后会单独发送，不能假称音频已生成。若运行时 ASMR/助眠语音模式已开启，不要手动传普通 voice_id，让工具自动使用当前角色的 ASMR 音色；语气和 text 也要更轻、更慢、更适合睡前聆听。",
   MEDIA_PROMPT_MODE === "guided"
     ? "若生成画面的主体包含当前角色本人（例如自拍、换装照、角色在景点打卡或与用户共同经历的画面），generate_character_image 的 include_current_role 必须设为 true；程序会直接附带已保存的人设图来锁定角色的面部、发型和参考图原生视觉风格。绝不预设为 2D、动漫或写实：人设图是什么风格，结果就保持什么风格。只有用户明确要求纯风景、纯物品、纯食物或画面中不要人物/角色时，才能设为 false；不要因为提示词没有重复角色名就设为 false。"
@@ -533,6 +534,55 @@ function getCommandArgument(ctx, command) {
   const text = ctx.message?.text || "";
   const commandPattern = new RegExp(`^/${command}(?:@[^\\s]+)?\\s*`, "i");
   return text.replace(commandPattern, "").trim();
+}
+
+function formatRoleProactivePreference(preference, policy = null) {
+  const mode = String(preference?.mode || "normal").toLocaleLowerCase();
+  const serverDisabled = policy?.disabledReason === "disabled-by-server"
+    ? "（服务器当前全局主动消息已关闭）"
+    : "";
+  if (mode === "off") {
+    return "已关闭";
+  }
+  if (mode === "low") {
+    return `较少（只会在角色空闲时偶尔主动联系）${serverDisabled}`;
+  }
+  if (mode === "high") {
+    const interval = Number(policy?.intervalMinutes) || 15;
+    return `较频繁（角色空闲时最短约 ${interval} 分钟一次）${serverDisabled}`;
+  }
+  if (mode === "custom") {
+    const interval = Number(preference?.intervalMinutes) || Number(policy?.intervalMinutes) || 5;
+    return `自定义：角色空闲时约每 ${interval} 分钟一次${serverDisabled}`;
+  }
+  return `默认（按服务器当前日程概率与冷却时间）${serverDisabled}`;
+}
+
+function parseRoleProactivePreferenceArgument(argument) {
+  const value = String(argument || "").trim().toLocaleLowerCase();
+  if (!value || ["status", "状态", "查看", "help", "帮助"].includes(value)) {
+    return { action: "show" };
+  }
+  if (["off", "关闭", "关", "0", "不要", "停止"].includes(value)) {
+    return { action: "set", preference: { mode: "off" } };
+  }
+  if (["low", "少", "较少", "低"].includes(value)) {
+    return { action: "set", preference: { mode: "low" } };
+  }
+  if (["normal", "默认", "恢复", "普通", "正常"].includes(value)) {
+    return { action: "set", preference: { mode: "normal" } };
+  }
+  if (["high", "多", "较多", "频繁", "高"].includes(value)) {
+    return { action: "set", preference: { mode: "high" } };
+  }
+  const intervalMatch = value.match(/(?:每(?:隔)?|interval|custom)?\s*(\d{1,4})\s*(?:m|min|分钟|分)?/iu);
+  if (intervalMatch) {
+    return {
+      action: "set",
+      preference: { mode: "custom", intervalMinutes: Number(intervalMatch[1]) },
+    };
+  }
+  return { action: "invalid" };
 }
 
 function isNewApiConfigured() {
@@ -1135,6 +1185,37 @@ function getToolDefinitions(
           },
         },
         required: ["reason"],
+        additionalProperties: false,
+      },
+    },
+  });
+
+  tools.push({
+    type: "function",
+    function: {
+      name: "set_role_proactive_frequency",
+      description:
+        "保存当前用户对当前角色主动消息频率的偏好。仅在用户明确要求多发、少发、关闭主动消息、恢复默认频率，或指定发送间隔时调用。偏好只影响当前 Telegram 用户与当前角色，不影响其他人；主动消息仍只会在角色空闲、吃饭或休息时发送。",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["off", "low", "normal", "high", "custom"],
+            description: "off=关闭，low=较少，normal=默认，high=较频繁，custom=按 interval_minutes 定时。",
+          },
+          interval_minutes: {
+            type: "number",
+            minimum: 5,
+            maximum: 1440,
+            description: "仅 mode=custom 时填写，范围 5 到 1440 分钟。",
+          },
+          reason: {
+            type: "string",
+            description: "用户明确提出频率偏好的简短依据。",
+          },
+        },
+        required: ["mode", "reason"],
         additionalProperties: false,
       },
     },
@@ -5848,6 +5929,35 @@ async function executeToolCall(
     };
   }
 
+  if (toolCall.function.name === "set_role_proactive_frequency") {
+    const scope = getScope(ctx);
+    const session = scope ? await findActiveSession(scope) : null;
+    if (!scope || !session?.roleName) {
+      return { ok: false, error: "请先用 /newchat 开启角色对话，再调整主动消息频率。" };
+    }
+    const result = await roleSchedule.setProactivePreference(
+      session.roleName,
+      scope,
+      {
+        mode: args.mode,
+        intervalMinutes: args.interval_minutes,
+      },
+      { reason: args.reason, at: new Date() },
+    );
+    if (!result.ok) {
+      return result;
+    }
+    return {
+      ok: true,
+      proactiveFrequencyUpdated: true,
+      roleName: session.roleName,
+      preference: result.preference,
+      message:
+        `主动消息频率已调整为${formatRoleProactivePreference(result.preference, result.policy)}。` +
+        "本轮不要再次调用 set_role_proactive_frequency，继续完成对用户的回复。",
+    };
+  }
+
   if (toolCall.function.name === "generate_character_3d_scene") {
     if (!settings.threeDEnabled) {
       return { ok: false, error: "3D 模型与骨骼动画功能已被管理员关闭。" };
@@ -9061,6 +9171,68 @@ bot.command("schedule", async (ctx) => {
   }
 });
 
+bot.command("proactive", async (ctx) => {
+  const scope = getScope(ctx);
+  if (!scope) {
+    return;
+  }
+
+  await runInSessionQueue(scope, async () => {
+    const session = await findActiveSession(scope);
+    if (!session?.roleName) {
+      await ctx.reply("当前没有进行中的角色对话。先用 /newchat 开始对话吧。");
+      return;
+    }
+
+    const parsed = parseRoleProactivePreferenceArgument(
+      getCommandArgument(ctx, "proactive"),
+    );
+    const usage =
+      "用法：/proactive off|low|normal|high|<分钟>\n" +
+      "例如：/proactive off、/proactive high、/proactive 30。\n" +
+      "主动消息只会在角色空闲、吃饭或休息时段发送，不会在睡眠、通勤或忙碌时打扰。";
+
+    if (parsed.action === "show") {
+      const preference = await roleSchedule.getProactivePreference(
+        session.roleName,
+        scope,
+      );
+      await ctx.reply(
+        `「${session.roleName}」当前主动消息频率：${formatRoleProactivePreference(
+          preference,
+          roleSchedule.getProactivePolicy(preference),
+        )}。\n\n${usage}`,
+      );
+      return;
+    }
+    if (parsed.action !== "set") {
+      await ctx.reply(`没看懂要设成什么频率。\n\n${usage}`);
+      return;
+    }
+
+    const result = await roleSchedule.setProactivePreference(
+      session.roleName,
+      scope,
+      parsed.preference,
+      {
+        at: new Date(),
+        reason: "用户通过 /proactive 调整主动消息频率",
+      },
+    );
+    if (!result.ok) {
+      await ctx.reply(result.error || "主动消息频率暂时没有调整成功，请稍后再试。");
+      return;
+    }
+    await ctx.reply(
+      `已将「${session.roleName}」的主动消息频率调整为${formatRoleProactivePreference(result.preference, result.policy)}。\n` +
+        "此设置只影响你和当前角色，不会影响其他用户或角色。",
+    );
+  }).catch(async (error) => {
+    console.error("处理 /proactive 失败:", error);
+    await ctx.reply("主动消息频率暂时没有调整成功，请稍后再试。 ");
+  });
+});
+
 bot.command("state", async (ctx) => {
   const scope = getScope(ctx);
   if (!scope) {
@@ -9732,10 +9904,11 @@ bot.help((ctx) => {
     ? "\n/admin 角色管理（仅限私聊）\n/cancel 退出角色管理"
     : "";
   const physicalStateHelp = "\n/state 查看角色当前的实体状态、六维短/长期情感及健康、病症、疲劳、困倦状态";
+  const proactiveHelp = "\n/proactive off|low|normal|high|<分钟> 调整当前角色主动消息频率";
 
   return ctx.reply(
     "/list 查看角色\n/newchat <角色名字> 开始或切换角色对话（同角色历史与状态会续接）\n/clear 或 /clearhistory 清空当前角色的全部对话记录（保留角色状态、日程与图片；不可恢复）\n/reset 管理员私聊从零重置当前角色：清空历史和角色状态，重制今天的分钟日程\n/schedule 查看角色今天的分钟日程\n/caffeine 让睡着的角色醒来并继续回复\n/refreshprompt 或 /refresh 仅刷新当前角色设定，保留历史\n/asmr on|off|status 切换助眠语音模式\n/voiceclone 设置当前角色的普通克隆音色\n/voiceclone asmr 设置当前角色的 ASMR 克隆音色\n/setvoice 同 /voiceclone\n/export 导出当前对话为 Markdown 文件\n/end 结束当前对话（角色状态与历史会保存）\n/whoami 查看自己的 Telegram ID\n/mcd 配置自己独立的麦当劳 MCP Token\n/mmfiles 查看自己上传到 MiniMax 的文件\n/mmdelete <file_id> 删除自己上传的 MiniMax 文件\n发送图片或 sticker 可让角色看图；若已开启“图片编辑”，可在图片配文自然说明让角色进图、换装、换场景、改背景或改画风，角色会主动调用 I2I 工具；之后也可以说“把上一张改成……”。单纯看图或识别 sticker 还需要开启“看图”。发送短视频会保存为后续视频参考；MiniMax provider 且开启“看图”时也会把视频直接交给多模态模型理解。管理员可明确要求把生成图或本轮上传图保存为角色设定图；若已开启“视频”，之后直接说“生成一段视频：……”即可。管理员可用 /mmvoices 查询音色、/mmvoice <角色名> <voice_id> 绑定普通音色、用 /mmvoice asmr <角色名> <voice_id> 绑定 ASMR 音色（/mmasmrvoice 仍兼容）。" +
-      physicalStateHelp + adminHelp,
+      physicalStateHelp + proactiveHelp + adminHelp,
   );
 });
 
