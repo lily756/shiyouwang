@@ -158,20 +158,11 @@ R2_MAX_BYTES=536870912
 
 系统不会把沙箱每一次普通写入都自动上传，避免把临时文件和敏感文件暴露出去；只有媒体链路自动产生公网 URL，或模型在用户明确要求时调用 `workspace_file` 的 `publish`，才会上传。`send` 仍然只通过 Telegram 回传文件，不依赖公网 URL。
 
-`MODEL_PROVIDER=default` 时纯文字消息使用 `OPENAI_MODEL`，它必须支持 OpenAI Chat Completions 的 `tools` / `tool_calls` 协议；图片和 sticker 会自动改用 `OPENAI_VISION_MODEL`，未配置时回退到 `OPENAI_MODEL`。`MODEL_PROVIDER=minimax` 时这两条路径改用 `.env.minimax` 中的 MiniMax-M3 Anthropic SDK 配置。默认 OpenAI 模型为 `deepseek-v4-pro`，并通过 `OPENAI_THINKING_ENABLED=false` 在主文本模型请求中传递 `thinking: { type: "disabled" }`。
+`MODEL_PROVIDER=default` 时纯文字消息使用 `OPENAI_MODEL`，它必须支持 OpenAI Chat Completions 的 `tools` / `tool_calls` 协议；图片和 sticker 同样使用 `OPENAI_MODEL`（需支持视觉输入，如 DeepSeek），不再有单独的视觉模型配置。`MODEL_PROVIDER=minimax` 时这两条路径改用 `.env.minimax` 中的 MiniMax-M3 Anthropic SDK 配置。默认 OpenAI 模型为 `deepseek-v4-pro`，并通过 `OPENAI_THINKING_ENABLED=false` 在主文本模型请求中传递 `thinking: { type: "disabled" }`。
 
 若模型最终回复命中常见安全拒答特征（包括“你好，我无法给到相关内容”），机器人会将这次完整模型请求与响应追加至 `runtime-logs/model-safety-traces.ndjson`。该文件是仅限本机用户读取的敏感调试日志（权限 `0600`），可能含对话、图片 data URL 和工具结果；排查完成后应妥善清理，切勿提交或外传。
 
 每次图片生成、图片编辑或视频生成会在 `runtime-logs/generation-tasks.ndjson` 追加任务生命周期日志（入队、开始、提交、发送成功或失败）。每次实际 Seedream 请求还会记录 `referenceImageCount` 与 `referenceImageKinds`，可据此确认请求是否带入场景图/人设图；日志权限同样为 `0600`，含角色名、提示词/编辑说明及任务错误摘要，但不记录 API Key、图片二进制或 Telegram 文件 URL。
-
-```dotenv
-# 仅图片 / sticker 使用的全模态模型；可与 OPENAI_MODEL 使用同一个服务
-OPENAI_VISION_MODEL=your_vision_model
-
-# 可选：全模态模型在另一家 OpenAI 兼容服务时填写
-OPENAI_VISION_API_KEY=your_vision_api_key
-OPENAI_VISION_API_BASE_URL=https://your-vision-provider/v1
-```
 
 图片、图片编辑、视频、图片理解、联网搜索、语音消息、MiniMax 文件上传、3D、受控工作区和 Python 沙箱默认关闭。管理员在私聊中发送 `/admin`，输入“功能”，再选择“时间”“图片”“图片编辑”（或“换装”）“视频”“看图”“搜索”“语音”“文件”“3D”“工作区”或“Python”，即可查看状态并输入“开启”或“关闭”；选择“provider”后发送 `image=minimax` 或 `video=seedance` 可运行时切换媒体服务。管理开关和 provider 选择会持久化到数据库。
 
@@ -213,9 +204,9 @@ SEEDREAM_LITE_API_KEY=your_bearer_key node test-seedream-lite.mjs \
 
 脚本遵循文档中的 Bearer 鉴权，不会读取或输出 `SEEDREAM_LITE_API_SECRET`；若服务实际要求 HMAC 签名，需要补充其签名请求头和原始请求体的具体规范后再实现。
 
-图片编辑（I2I）需要通过 `/admin → 功能 → 图片编辑 → 开启` 启用，且文本模型必须支持 Function Calling。上传图片时，可直接写“让角色坐在这张图的窗边”“给她换成黑色风衣”“把背景换成雨夜东京”；机器人会跳过视觉理解模型，在首轮强制文本模型调用 `edit_reference_image`，图片字节只交给图生图工具，因此这条明确编辑路径不依赖 `OPENAI_VISION_MODEL`。之后在同一角色对话中也可以说“把上一张改成水彩画风”“让刚才那张里的角色走进咖啡店”；最近 8 张本地保存的参考图会提供给模型选择。单纯看图、评价或识别仍会走图片理解，要求 `/admin → 功能 → 看图 → 开启` 和视觉模型支持图片输入。角色出现在编辑结果中时，角色人设图是不可改变的硬性风格锚点：不预设二次元/插画或写实，人设图本身是什么风格，角色就必须保持什么风格；哪怕背景是真实世界照片，也只做透视、遮挡和光影融合，不能把角色转换成另一种风格。该场景需要 Seedream 同时接收场景图和人设图；若没有人设图或使用只支持单参考图的 NewAPI，机器人会拒绝角色入景/换装，而不会冒险生成画风跑偏的角色。请只上传你有权使用的图片；模型会尽量保持未要求改变的主体与画面，但生成结果可能与参考图有差异。
+图片编辑（I2I）需要通过 `/admin → 功能 → 图片编辑 → 开启` 启用，且文本模型必须支持 Function Calling。上传图片时，可直接写“让角色坐在这张图的窗边”“给她换成黑色风衣”“把背景换成雨夜东京”；机器人会跳过视觉理解模型，在首轮强制文本模型调用 `edit_reference_image`，图片字节只交给图生图工具，因此这条明确编辑路径不依赖视觉输入能力。之后在同一角色对话中也可以说“把上一张改成水彩画风”“让刚才那张里的角色走进咖啡店”；最近 8 张本地保存的参考图会提供给模型选择。单纯看图、评价或识别仍会走图片理解，要求 `/admin → 功能 → 看图 → 开启` 和视觉模型支持图片输入。角色出现在编辑结果中时，角色人设图是不可改变的硬性风格锚点：不预设二次元/插画或写实，人设图本身是什么风格，角色就必须保持什么风格；哪怕背景是真实世界照片，也只做透视、遮挡和光影融合，不能把角色转换成另一种风格。该场景需要 Seedream 同时接收场景图和人设图；若没有人设图或使用只支持单参考图的 NewAPI，机器人会拒绝角色入景/换装，而不会冒险生成画风跑偏的角色。请只上传你有权使用的图片；模型会尽量保持未要求改变的主体与画面，但生成结果可能与参考图有差异。
 
-图片理解需要通过 `/admin → 功能 → 看图 → 开启` 启用。`MODEL_PROVIDER=minimax` 时使用 MiniMax Anthropic 多模态接口（MiniMax-M3），否则 `OPENAI_VISION_MODEL`（未设置时为 `OPENAI_MODEL`）必须支持 OpenAI Chat Completions 的视觉输入。开启后，在与机器人的私聊中直接发送图片或 sticker 即可；MiniMax 模式下上传视频也会将视频内容交给视觉模型理解。I2I 工具始终会显示在工具列表中，当前图片或当前角色的近期图片历史可作为参考图，但只有同时开启“图片编辑”且用户明确要求修改时才会执行。
+图片理解需要通过 `/admin → 功能 → 看图 → 开启` 启用。`MODEL_PROVIDER=minimax` 时使用 MiniMax Anthropic 多模态接口（MiniMax-M3），否则 `OPENAI_MODEL` 必须支持 OpenAI Chat Completions 的视觉输入。开启后，在与机器人的私聊中直接发送图片或 sticker 即可；MiniMax 模式下上传视频也会将视频内容交给视觉模型理解。I2I 工具始终会显示在工具列表中，当前图片或当前角色的近期图片历史可作为参考图，但只有同时开启“图片编辑”且用户明确要求修改时才会执行。
 
 部分 OpenAI 兼容视觉服务不接受 `data:image/...;base64,...`，仅接受公网 HTTPS 图片 URL。可设置 `VISION_USE_TELEGRAM_FILE_URL=true` 让图片理解请求直接使用 Telegram 文件下载 URL；该 URL 包含 Bot Token，视觉提供商将能看到该凭据，存在高风险，仅在明确接受风险时使用。机器人不会把该 URL 写入数据库，模型安全追踪日志也会自动打码；长期方案仍应使用自建的短时签名图片代理。
 

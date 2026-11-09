@@ -227,7 +227,8 @@ const MODEL_CONVERSATION_MESSAGE_LIMIT = Math.max(
   Math.min(120, Math.floor(readNumberEnv("MODEL_CONVERSATION_MESSAGE_LIMIT", 32))),
 );
 const TEXT_MODEL = process.env.OPENAI_MODEL || "";
-const VISION_MODEL = process.env.OPENAI_VISION_MODEL || TEXT_MODEL;
+// 图片/sticker 理解与文本共用同一个模型和服务，不再有独立视觉模型。
+const VISION_MODEL = TEXT_MODEL;
 const ROLE_SCHEDULE_ENABLED = !["false", "0", "no", "off"].includes(
   String(process.env.ROLE_SCHEDULE_ENABLED || "true").trim().toLowerCase(),
 );
@@ -281,9 +282,6 @@ const ROLE_BEHAVIOR_TOMORROW_PROBABILITY = readNumberEnv(
 );
 const OPENAI_THINKING_ENABLED = !["false", "0", "no", "off"].includes(
   String(process.env.OPENAI_THINKING_ENABLED || "false").trim().toLowerCase(),
-);
-const HAS_SEPARATE_VISION_PROVIDER = Boolean(
-  process.env.OPENAI_VISION_API_KEY || process.env.OPENAI_VISION_API_BASE_URL,
 );
 const VISION_USE_TELEGRAM_FILE_URL = ["true", "1", "yes", "on"].includes(
   String(process.env.VISION_USE_TELEGRAM_FILE_URL || "false").trim().toLowerCase(),
@@ -406,13 +404,6 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   baseURL: process.env.OPENAI_API_BASE_URL,
 });
-const visionOpenai = HAS_SEPARATE_VISION_PROVIDER
-  ? new OpenAI({
-      apiKey: process.env.OPENAI_VISION_API_KEY || process.env.OPENAI_API_KEY,
-      baseURL:
-        process.env.OPENAI_VISION_API_BASE_URL || process.env.OPENAI_API_BASE_URL,
-    })
-  : openai;
 const bot = new Telegraf(process.env.TG_BOT_TOKEN);
 const lifeAssistant = createLifeAssistant({ db, bot });
 const mcdMcp = createMcDonaldsMcp({ db });
@@ -821,12 +812,12 @@ function getImageProviderStatus() {
 
 function getVisionModelRoute() {
   return {
-    client: MINIMAX_ENABLED && minimaxAnthropic ? minimaxAnthropic : visionOpenai,
+    client: MINIMAX_ENABLED && minimaxAnthropic ? minimaxAnthropic : openai,
     model: VISION_MODEL,
     label: MINIMAX_ENABLED
       ? `MiniMax（${VISION_MODEL || "未配置"}）`
       : (VISION_MODEL || "未配置"),
-    usesDedicatedProvider: MINIMAX_ENABLED || HAS_SEPARATE_VISION_PROVIDER,
+    usesDedicatedProvider: false,
   };
 }
 
@@ -1722,7 +1713,11 @@ async function generateThreeSceneWithModel({ role, prompt, animationPrompt, role
 
 function buildRoleSchedulePlanningPrompt(planning, dateKey = "") {
   if (!planning?.longTermPlan || !planning?.weeklyPlan || !planning?.dayPlan) {
-    return "当前没有额外的分层计划；请按角色设定安排完整的一天。";
+    return "";
+  }
+  // 如果是模板兜底生成的分层计划，不要强行绑架模型的真实人设日程
+  if (planning?.dayPlan?.source === "seeded" || planning?.longTermPlan?.source === "seeded") {
+    return "";
   }
   const goals = (planning.longTermPlan.goals || [])
     .filter((goal) => goal?.status !== "completed")
@@ -1740,13 +1735,10 @@ function buildRoleSchedulePlanningPrompt(planning, dateKey = "") {
     .map((entry) => `- ${String(Math.floor(entry.startMinute / 60)).padStart(2, "0")}:${String(entry.startMinute % 60).padStart(2, "0")}-${String(Math.floor(entry.endMinute / 60)).padStart(2, "0")}:${String(entry.endMinute % 60).padStart(2, "0")} ${entry.activity} @${entry.location}${entry.goalId ? `（goalId=${entry.goalId}）` : ""}${entry.commitmentId ? `（commitmentId=${entry.commitmentId}）` : ""}`)
     .join("\n");
   return [
-    "长期目标：",
-    goals || "- 保持角色自己的长期生活主线。",
-    "本周重点：",
-    weeklyFocus || "- 根据长期目标安排本周节奏。",
+    goals ? `长期目标：\n${goals}` : "",
+    weeklyFocus ? `本周重点：\n${weeklyFocus}` : "",
     commitments ? `今天不可丢失的周内安排：\n${commitments}` : "",
-    "今天的粗粒度提纲（必须将其扩展成完整分钟日程，允许为真实交通插入 prepare/commute，但不能丢掉高优先级活动）：",
-    dayOutline,
+    dayOutline ? `今天的参考提纲：\n${dayOutline}` : "",
   ].filter(Boolean).join("\n");
 }
 
@@ -1756,32 +1748,28 @@ async function generateRoleScheduleWithModel({ role, dateKey, timezone, seed, se
   }
 
   const systemPrompt = [
-    "你是角色日程编排器。你要为一个长期生活在现实世界中的聊天角色安排今天的完整日程。",
-    "系统会给出长期目标、本周重点和今天的粗粒度提纲。它们是同一角色的连续生活计划：你要把今天提纲展开成分钟级日程，不能把它当成一次性灵感，也不能用与之冲突的活动替换高优先级安排。",
-    "日程必须覆盖当天 00:00 到 24:00，时间边界精确到分钟；活动之间不要重叠。这里的“精确到分钟”只表示起止时间使用分钟，不是要求每分钟单独生成一条活动。",
-    `本日日程随机种子：${Number.isFinite(Number(seed)) ? Number(seed) >>> 0 : "未提供"}（${seedKey || "role-daily-plan"}）。请用它决定今天活动的细节和时间变化；同一角色、同一日期、同一种子重算时，应尽量保持相同的作息骨架。`,
-    "请根据角色设定安排有生活感但不过分戏剧化的活动，必须包含合理的睡眠时段，也可以包含吃饭、休息、工作、学习、运动、通勤或创作。正常情况下使用 8 到 24 条有意义的日程；禁止把同一活动、地点或空档拆成连续的一分钟条目。只有同一住宅/办公室内的一次步行 commute 可以是 1 分钟，且不能连续重复。",
-    "每一条都必须填写稳定的 location（地点名）和该地点内的 environment（具体环境）；environment 不能代替 location。",
-    "只要相邻的两个主要活动 location 不同，就必须在前一个活动结束、后一个活动开始之前安排连续的 prepare 和 commute 条目，不能瞬移。prepare 要留出换衣服、穿鞋、拿钥匙/手机/钱包/包等出门准备时间；commute 要写清交通方式或路况并留出真实的交通分钟数，commute 结束才算到达。",
-    "prepare 的 kind 固定为 prepare，commute 的 kind 固定为 commute；prepare/commute 的 proactive 必须为 false，也不要把它们写成可 roll 的主要行为。若时间不够容纳准备和交通，就缩短其他活动或不要安排跨地点活动。",
-    "只输出 JSON，不要 Markdown、解释或额外文字。格式必须是 {\"entries\":[{\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"kind\":\"sleep|meal|rest|work|study|exercise|routine|creative|social|prepare|commute\",\"activity\":\"...\",\"location\":\"...\",\"destination\":\"...\",\"environment\":\"...\",\"mood\":\"...\",\"goalId\":\"...\",\"commitmentId\":\"...\",\"preparationMinutes\":15,\"travelMinutes\":20,\"proactive\":true|false,\"physicalState\":{\"outfit\":\"...\",\"heldItems\":[\"...\"],\"internalDevices\":[\"...\"],\"bodyState\":\"...\",\"limbStates\":{\"leftArm\":\"...\",\"rightArm\":\"...\",\"leftLeg\":\"...\",\"rightLeg\":\"...\"}}}]}；destination、preparationMinutes、travelMinutes 只在需要时填写。若提纲条目给了 goalId 或 commitmentId，请在对应展开活动中原样保留；prepare/commute 不需要填写它们。",
-    "physicalState 是角色的连续性状态账本：outfit=穿着，heldItems=当前手持物品数组，internalDevices=身体内部装置数组，bodyState=身体整体状态，limbStates=四肢或手脚状态；carriedItems 仍可作为随身物品数组。字段省略表示沿用上一条，数组为空或文本为 null 才表示明确清空。除非 prepare 阶段或活动明确导致变化，否则必须原样沿用，不要每条活动随机换装、换手持物品、添加/移除装置、改变身体状态或四肢状态。",
-    "睡觉或午睡的 kind 必须是 sleep 或 nap；吃饭的 kind 必须是 meal；只有短暂休息、用餐或有明确生活瞬间且适合偶尔分享时才把 proactive 设为 true，连续数小时的自由休息、睡前放松和时间填充应设为 false；prepare 和 commute 必须为 false。",
+    "你是角色日程编排器。你要根据角色的具体人设、身份、世界观背景和生活习惯，安排一份该角色今天 00:00 到 24:00 的完整真实日程。",
+    "日程必须完全忠实于角色的人设、职业与背景（例如执事侍奉主人打理宅邸、学生上学读书、医生药师看诊调药、狐妖神社修行与侍奉、猫娘日常嬉戏与陪伴等），严禁套用千篇一律的现代打工人/自习室模板（除非角色自身人设就是现代打工人）。",
+    "日程必须覆盖当天 00:00 到 24:00，时间边界精确到分钟，首尾相接不重叠。保持精炼实用，通常安排 10 到 18 条有意义的核心日程，避免小说式冗长描写；必须包含合理的睡眠时段（kind 设为 sleep 或 nap）。",
+    "每一条都必须填写稳定的 location（符合角色身份的地点名，如宅邸卧房、书房、药房、学校等）和 environment（该地点内的具体环境简述）。",
+    "只有在短暂休息、用餐或有生活瞬间适合偶尔跟用户分享时才将 proactive 设为 true；睡眠、通勤或大段专注工作应设为 false。",
+    "只输出合法 JSON，不要 Markdown、解释或额外文字。格式必须是 {\"entries\":[{\"start\":\"HH:MM\",\"end\":\"HH:MM\",\"kind\":\"sleep|meal|rest|work|study|exercise|routine|creative|social|prepare|commute\",\"activity\":\"...\",\"location\":\"...\",\"destination\":\"...\",\"environment\":\"...\",\"mood\":\"...\",\"proactive\":true|false}]}",
   ].join("\n");
+  const planningPrompt = buildRoleSchedulePlanningPrompt(planning, dateKey);
   const userPrompt = [
     `日期：${dateKey}`,
     `时区：${timezone}`,
     `角色名称：${role.name}`,
     `角色简介：${role.description}`,
-    `角色设定：\n${String(role.systemPrompt || "").slice(0, 6_000)}`,
-    `分层生活计划：\n${buildRoleSchedulePlanningPrompt(planning, dateKey)}`,
-    "请安排一份有明确分钟边界的日程。",
-  ].join("\n\n");
+    `角色人设设定：\n${String(role.systemPrompt || "").slice(0, 4_000)}`,
+    planningPrompt ? `参考生活计划：\n${planningPrompt}` : "",
+    "请为该角色生成今天 00:00 到 24:00 的完整日程 JSON。",
+  ].filter(Boolean).join("\n\n");
 
   if (MINIMAX_ENABLED && minimaxAnthropic) {
     const response = await minimaxAnthropic.messages.create({
       model: getRoleScheduleModelName(),
-      max_tokens: Math.min(4_096, minimaxProvider.config.maxTokens || 4_096),
+      max_tokens: Math.min(8_192, minimaxProvider.config.maxTokens || 8_192),
       system: systemPrompt,
       messages: [{ role: "user", content: userPrompt }],
     });
@@ -1790,8 +1778,8 @@ async function generateRoleScheduleWithModel({ role, dateKey, timezone, seed, se
 
   const response = await openai.chat.completions.create({
     model: getRoleScheduleModelName(),
-    max_tokens: 4_096,
-    temperature: 0.75,
+    max_tokens: 8_192,
+    temperature: 0.7,
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
@@ -6724,6 +6712,80 @@ async function writeModelSafetyTrace({ ctx, request, response, assistantMessage,
   }
 }
 
+function formatLogValue(value, maxLen = 4000) {
+  if (value === null || value === undefined) return String(value);
+  if (typeof value === "string") {
+    if (value.startsWith("data:image/") || value.startsWith("data:video/")) {
+      return value.slice(0, 60) + `... [base64 truncated, length=${value.length}]`;
+    }
+    return value.length > maxLen ? value.slice(0, maxLen) + `... [truncated ${value.length - maxLen} chars]` : value;
+  }
+  if (typeof value === "object") {
+    try {
+      const sanitized = JSON.parse(
+        JSON.stringify(value, (_key, val) => {
+          if (typeof val === "string" && (val.startsWith("data:image/") || val.startsWith("data:video/"))) {
+            return val.slice(0, 60) + `... [base64 truncated, length=${val.length}]`;
+          }
+          return val;
+        })
+      );
+      return JSON.stringify(sanitized, null, 2);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function logConversationError(contextTitle, error, {
+  ctx = null,
+  session = null,
+  messages = null,
+  request = null,
+  client = null,
+  model = null,
+} = {}) {
+  const divider = "=".repeat(60);
+  const now = new Date().toISOString();
+  const chatId = ctx?.chat?.id ?? session?.chatId ?? "unknown";
+  const userId = ctx?.from?.id ?? session?.userId ?? "unknown";
+  const roleName = session?.roleName ?? "unknown";
+  const baseURL = client?.baseURL ?? process.env.OPENAI_API_BASE_URL ?? "unknown";
+
+  const errorDetails = {
+    name: error?.name,
+    message: error?.message || String(error),
+    status: error?.status ?? error?.statusCode ?? error?.response?.status,
+    code: error?.code ?? error?.error?.code,
+    type: error?.type ?? error?.error?.type,
+    param: error?.param ?? error?.error?.param,
+    responseData: error?.response?.data || error?.error,
+    stack: error?.stack,
+  };
+
+  console.error(`\n${divider}`);
+  console.error(`[对话生成失败] ${contextTitle} (${now})`);
+  console.error(`会话信息: Role="${roleName}", ChatID=${chatId}, UserID=${userId}`);
+  console.error(`模型配置: Provider=${MODEL_PROVIDER}, Model=${model || TEXT_MODEL}, BaseURL=${baseURL}`);
+  console.error(`错误详情:\n${formatLogValue(errorDetails)}`);
+
+  if (request) {
+    console.error(`请求载荷 Payload (消息数: ${request.messages?.length || 0}):`);
+    console.error(formatLogValue({
+      model: request.model,
+      tool_choice: request.tool_choice,
+      tools_count: request.tools?.length,
+      thinking: request.thinking,
+      messages: request.messages,
+    }));
+  } else if (messages && Array.isArray(messages)) {
+    console.error(`当前上下文 Messages (${messages.length} 条):`);
+    console.error(formatLogValue(messages));
+  }
+  console.error(`${divider}\n`);
+}
+
 async function runModelWithAnthropicTools(
   ctx,
   messages,
@@ -6810,7 +6872,17 @@ async function runModelWithAnthropicTools(
         request.thinking = { type: "adaptive" };
       }
 
-      const response = await minimaxAnthropic.messages.create(request);
+      let response;
+      try {
+        response = await minimaxAnthropic.messages.create(request);
+      } catch (apiError) {
+        logConversationError("MiniMax Anthropic 接口请求失败", apiError, {
+          ctx,
+          request,
+          model: request.model,
+        });
+        throw apiError;
+      }
       const content = Array.isArray(response?.content) ? response.content : [];
       const toolCalls = getAnthropicToolCalls(content);
       const storedAssistantMessage = { role: "assistant", content };
@@ -6984,7 +7056,18 @@ async function runModelWithTools(
         request.thinking = { type: "disabled" };
       }
 
-      const response = await client.chat.completions.create(request);
+      let response;
+      try {
+        response = await client.chat.completions.create(request);
+      } catch (apiError) {
+        logConversationError("OpenAI 兼容接口请求失败", apiError, {
+          ctx,
+          request,
+          client,
+          model,
+        });
+        throw apiError;
+      }
       const assistantMessage = response.choices[0]?.message;
 
       if (!assistantMessage) {
@@ -7151,11 +7234,32 @@ function getSessionMessagesForModel(session) {
 
 function parseExplicitRuntimeLocationUpdate(text) {
   const value = String(text || "").trim();
-  const match = value.match(
-    /^[（(]\s*(?:已经\s*)?(?:瞬移到|到达|回到|来到|移动到)\s*([^（）()\n，。！？!?]{1,80})\s*[）)]$/u,
-  );
-  const location = match?.[1]?.trim() || "";
-  return location && !["这里", "那里", "某处"].includes(location) ? location : "";
+  if (!value) return "";
+
+  if (/^(?:请让|要是|如果|假设|希望|打算去|想要去|准备去)/u.test(value)) {
+    return "";
+  }
+
+  const actionMatches = [...value.matchAll(/[（(]([^）)]+)[）)]/gu)];
+  const candidateTexts = actionMatches.length > 0
+    ? actionMatches.map((m) => m[1])
+    : (/^[^\n]{1,60}$/u.test(value) && !value.includes("请让") ? [value] : []);
+
+  const locationVerbRegex = /(?:瞬移到|瞬移回|瞬移|到达|回到|来到|移步到|移动到|走进|进入|到了|去往|去到|带[^\n，。！？!?]*?(?:回|到|去))\s*([^（）()\n，。！？!?、]{1,30}?)(?:了|吧|呢|呀)?(?:[）)\s，。！？!?、]|$)/u;
+
+  for (const candidate of candidateTexts) {
+    if (/(?:请让|要是|如果|假设|想要|打算)/u.test(candidate)) continue;
+    const match = candidate.match(locationVerbRegex);
+    if (match?.[1]) {
+      let loc = match[1].trim();
+      loc = loc.replace(/^(?:自己|我们|和[^\s]+?一起|带着[^\s]+?)\s*/u, "");
+      if (loc && !["这里", "那里", "某处", "这个地方", "那个地方", "地方"].includes(loc)) {
+        return loc;
+      }
+    }
+  }
+
+  return "";
 }
 
 async function applyExplicitRuntimeLocationUpdate(scope, text, { sessionId = null } = {}) {
@@ -7584,6 +7688,11 @@ async function processConversationTask(scope, { context = null, modelClient = op
   const messages = [...modelHistory, ...pendingUserMessages];
   const batchText = pendingTasks.map((task) => task.text).join("\n");
   try {
+    try {
+      await applyExplicitRuntimeLocationUpdate(scope, batchText, { sessionId: session._id });
+    } catch (locErr) {
+      console.warn("更新显式地点失败:", locErr.message || locErr);
+    }
     await ctx.sendChatAction("typing").catch(() => undefined);
     const asmrEnabled = await updateAsmrModeFromText(scope, batchText);
     let imageEditHistory = [];
@@ -7636,7 +7745,13 @@ async function processConversationTask(scope, { context = null, modelClient = op
       await markConversationTasksDiscarded(taskIds, "生成失败前角色会话已切换或结束");
       return;
     }
-    console.error("生成后台会话回复失败:", error);
+    logConversationError("生成后台会话回复失败", error, {
+      ctx,
+      session,
+      messages,
+      modelClient,
+      model: TEXT_MODEL,
+    });
     await db.updateAsync(
       { _id: { $in: taskIds } },
       {
@@ -8631,7 +8746,12 @@ async function handleVideoReferenceUpload(ctx, scope) {
       await replyWithText(ctx, result.answer);
     }
   } catch (error) {
-    console.error("处理视频参考指令失败:", error);
+    logConversationError("处理视频参考指令失败", error, {
+      ctx,
+      session,
+      messages: modelMessages,
+      model: TEXT_MODEL,
+    });
     await ctx.reply("视频已经收好，但这次没能处理附言。稍后直接用文字说明如何参考它就好。 ");
   }
 }
@@ -8757,11 +8877,16 @@ async function handleVisualConversation(ctx, scope, { sourceLabel, caption, down
       await replyWithText(ctx, result.answer);
     }
   } catch (error) {
-    console.error(forceImageEdit ? "图片编辑请求失败:" : "图片理解失败:", error);
+    logConversationError(forceImageEdit ? "图片编辑请求失败" : "图片理解失败", error, {
+      ctx,
+      session,
+      messages: modelMessages,
+      model: VISION_MODEL,
+    });
     await ctx.reply(
       forceImageEdit
         ? "这次没能启动图片编辑。请确认文本模型支持 Function Calling、图片编辑功能已开启且图片服务配置正确；当前对话上下文没有被清除。"
-        : "这次没能看清图片或 sticker。请确认 OPENAI_VISION_MODEL（或回退的 OPENAI_MODEL）支持视觉输入后再试。当前对话上下文没有被清除。",
+        : "这次没能看清图片或 sticker。请确认 OPENAI_MODEL 支持视觉输入后再试。当前对话上下文没有被清除。",
     );
   }
 }
@@ -9358,6 +9483,48 @@ bot.command("state", async (ctx) => {
 
 bot.command("whoami", async (ctx) => {
   await ctx.reply(`你的 Telegram 用户 ID：${ctx.from?.id ?? "未知"}`);
+});
+
+async function createOrRefreshAuthBindCode(scope, userInfo = {}) {
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  // Clear older unused bind codes for this user
+  await db.removeAsync({
+    type: "auth-bind-code",
+    userId: scope.userId,
+  }, { multi: true });
+
+  const record = {
+    type: "auth-bind-code",
+    code,
+    userId: scope.userId,
+    chatId: scope.chatId,
+    username: userInfo.username || "",
+    firstName: userInfo.first_name || userInfo.firstName || "",
+    lastName: userInfo.last_name || userInfo.lastName || "",
+    createdAt: now,
+    expiresAt,
+  };
+  await db.insertAsync(record);
+  return { code, expiresAt };
+}
+
+bot.command(["bind", "login", "web", "auth"], async (ctx) => {
+  if (!isPrivateChat(ctx)) {
+    await ctx.reply("为了您的账户安全，请在与机器人的私聊中发送 /bind 获取登录码。");
+    return;
+  }
+  const scope = getScope(ctx);
+  if (!scope) return;
+  const { code } = await createOrRefreshAuthBindCode(scope, ctx.from);
+  await ctx.reply([
+    `🔑 您的网页 / 客户端绑定码为：【${code}】`,
+    "",
+    "⏱ 有效期：15 分钟",
+    "📱 在 Web 页面或 App 打开时输入此 6 位绑定码，即可无缝同步当前 Telegram 账号的所有角色与会话！",
+  ].join("\n"));
 });
 
 bot.command("mcd", async (ctx) => {
@@ -10248,12 +10415,17 @@ if (require.main === module) {
 }
 
 module.exports = {
+  applyExplicitRuntimeLocationUpdate,
+  bot,
+  launchBot,
   buildModelMessages,
   coalesceStateUpdateToolCalls,
+  createOrRefreshAuthBindCode,
   db,
   executeToolCallsForRound,
   findActiveSession,
   filterCompletedStateUpdateTools,
+  generateRoleScheduleWithModel,
   buildNewApiSafeImageFallbackPrompt,
   getNewApiEndpoint,
   getNewApiImageEditSizeForAspectRatio,
@@ -10267,6 +10439,7 @@ module.exports = {
   processConversationTask,
   requestNewApiCharacterImage,
   replaceActiveSession,
+  roleSchedule,
   roleStore,
   runModelWithTools,
   stripInjectedRoleStateFromImageContext,

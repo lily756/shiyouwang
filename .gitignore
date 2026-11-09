@@ -145,6 +145,9 @@ vite.config.ts.timestamp-*
 
 data
 data.sqlite*
+*.sqlite
+*.sqlite-*
+.DS_Store
 role-assets/
 conversation-image-assets/
 runtime-logs/

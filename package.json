@@ -5,6 +5,10 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "server": "node server/index.js",
+    "all": "START_BOT=true node server/index.js",
+    "client": "cd client && npm run web",
+    "build:web": "cd client && npx expo export -p web",
     "test": "node --test test/*.test.js"
   },
   "keywords": [],
@@ -13,13 +17,17 @@
   "type": "commonjs",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
+    "@hono/node-server": "^1.19.18",
+    "@hono/node-ws": "^1.3.1",
     "@modelcontextprotocol/sdk": "^1.13.0",
     "@seald-io/nedb": "^4.1.2",
     "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
+    "hono": "^4.13.17",
     "minimax-mcp-js": "^0.0.17",
     "openai": "^7.0.0",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "ws": "^8.22.2"
   }
 }

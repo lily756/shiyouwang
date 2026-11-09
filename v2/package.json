@@ -1,0 +1,15 @@
+{
+  "name": "character-os-v2",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --no-warnings src/server/main.ts",
+    "test": "node --no-warnings --test tests/unit/*.test.ts tests/e2e/*.test.ts",
+    "test:unit": "node --no-warnings --test tests/unit/*.test.ts",
+    "test:e2e": "node --no-warnings --test tests/e2e/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6"
+  }
+}
