@@ -6,8 +6,10 @@
   "scripts": {
     "start": "node index.js",
     "server": "node server/index.js",
+    "web": "node server/index.js",
     "all": "START_BOT=true node server/index.js",
-    "client": "cd client && npm run web",
+    "client": "node server/index.js",
+    "client:dev": "cd client && npm run web",
     "build:web": "cd client && npx expo export -p web",
     "test": "node --test test/*.test.js"
   },
